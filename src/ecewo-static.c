@@ -1,3 +1,24 @@
+// Copyright 2025-2026 Savas Sahin <savashn@proton.me>
+
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 #include "ecewo-static.h"
 #include "ecewo-fs.h"
 #include <string.h>
@@ -6,7 +27,7 @@
 #include <ctype.h>
 #include <time.h>
 
-const char *get_mime_type(const char *path) {
+const char *ecewo_static_mime_type(const char *path) {
   if (!path)
     return "application/octet-stream";
 
@@ -14,12 +35,10 @@ const char *get_mime_type(const char *path) {
   if (!ext)
     return "application/octet-stream";
 
-  // Convert to lowercase for comparison
   char ext_lower[32];
   size_t i;
-  for (i = 0; i < sizeof(ext_lower) - 1 && ext[i]; i++) {
-    ext_lower[i] = tolower(ext[i]);
-  }
+  for (i = 0; i < sizeof(ext_lower) - 1 && ext[i]; i++)
+    ext_lower[i] = (char)tolower((unsigned char)ext[i]);
   ext_lower[i] = '\0';
 
   // HTML/CSS/JS
@@ -105,658 +124,876 @@ const char *get_mime_type(const char *path) {
   return "application/octet-stream";
 }
 
+typedef struct {
+  const char *index;
+  bool etag;
+  int max_age;
+  bool dotfiles;
+  bool redirect;
+  bool immutable;
+  char **extensions; // borrowed pointers into app arena
+  int extensions_count;
+} static_cfg_t;
+
+typedef struct {
+  int max_age;
+  bool last_modified;
+  bool cache_control;
+  bool immutable;
+  bool etag;
+  const char *content_type; // borrowed from ctx-owned strdup
+  const char *root;
+  bool dotfiles;
+} send_cfg_t;
+
+struct ecewo_static_options_s {
+  char *index;
+  char **extensions;
+  int extensions_count;
+  bool etag;
+  int max_age;
+  bool dotfiles;
+  bool redirect;
+  bool immutable;
+};
+
+struct ecewo_send_file_options_s {
+  int max_age;
+  bool last_modified;
+  bool cache_control;
+  bool immutable;
+  bool etag;
+  char *content_type;
+  char *root;
+  bool dotfiles;
+};
+
+ecewo_static_options_t *ecewo_static_options_new(void) {
+  ecewo_static_options_t *opts = calloc(1, sizeof(*opts));
+  if (!opts)
+    return NULL;
+
+  opts->index = strdup("index.html");
+  if (!opts->index) {
+    free(opts);
+    return NULL;
+  }
+  opts->etag = true;
+  opts->redirect = true;
+  // max_age=0, dotfiles=false, immutable=false, extensions=NULL implicit via calloc
+  return opts;
+}
+
+static void free_extensions(char **exts, int count) {
+  if (!exts)
+    return;
+  for (int i = 0; i < count; i++)
+    free(exts[i]);
+  free(exts);
+}
+
+void ecewo_static_options_free(ecewo_static_options_t *opts) {
+  if (!opts)
+    return;
+  free(opts->index);
+  free_extensions(opts->extensions, opts->extensions_count);
+  free(opts);
+}
+
+void ecewo_static_options_set_index(ecewo_static_options_t *opts, const char *index) {
+  if (!opts)
+    return;
+  char *copy = NULL;
+  if (index) {
+    copy = strdup(index);
+    if (!copy)
+      return;
+  }
+  free(opts->index);
+  opts->index = copy;
+}
+
+void ecewo_static_options_set_extensions(ecewo_static_options_t *opts, const char *const *exts, int count) {
+  if (!opts)
+    return;
+  if (count < 0)
+    count = 0;
+
+  char **copy = NULL;
+  if (count > 0 && exts) {
+    copy = calloc((size_t)count, sizeof(char *));
+    if (!copy)
+      return;
+    for (int i = 0; i < count; i++) {
+      if (!exts[i]) {
+        free_extensions(copy, i);
+        return;
+      }
+      copy[i] = strdup(exts[i]);
+      if (!copy[i]) {
+        free_extensions(copy, i);
+        return;
+      }
+    }
+  }
+  free_extensions(opts->extensions, opts->extensions_count);
+  opts->extensions = copy;
+  opts->extensions_count = (copy ? count : 0);
+}
+
+void ecewo_static_options_set_etag(ecewo_static_options_t *opts, bool etag) {
+  if (opts)
+    opts->etag = etag;
+}
+void ecewo_static_options_set_max_age(ecewo_static_options_t *opts, int seconds) {
+  if (opts)
+    opts->max_age = seconds;
+}
+void ecewo_static_options_set_dotfiles(ecewo_static_options_t *opts, bool allow) {
+  if (opts)
+    opts->dotfiles = allow;
+}
+void ecewo_static_options_set_redirect(ecewo_static_options_t *opts, bool redirect) {
+  if (opts)
+    opts->redirect = redirect;
+}
+void ecewo_static_options_set_immutable(ecewo_static_options_t *opts, bool immutable) {
+  if (opts)
+    opts->immutable = immutable;
+}
+
+ecewo_send_file_options_t *ecewo_send_file_options_new(void) {
+  ecewo_send_file_options_t *opts = calloc(1, sizeof(*opts));
+  if (!opts)
+    return NULL;
+  opts->last_modified = true;
+  opts->cache_control = true;
+  opts->etag = true;
+  // everything else zero/NULL/false via calloc
+  return opts;
+}
+
+void ecewo_send_file_options_free(ecewo_send_file_options_t *opts) {
+  if (!opts)
+    return;
+  free(opts->content_type);
+  free(opts->root);
+  free(opts);
+}
+
+void ecewo_send_file_options_set_max_age(ecewo_send_file_options_t *opts, int seconds) {
+  if (opts)
+    opts->max_age = seconds;
+}
+void ecewo_send_file_options_set_last_modified(ecewo_send_file_options_t *opts, bool enabled) {
+  if (opts)
+    opts->last_modified = enabled;
+}
+void ecewo_send_file_options_set_cache_control(ecewo_send_file_options_t *opts, bool enabled) {
+  if (opts)
+    opts->cache_control = enabled;
+}
+void ecewo_send_file_options_set_immutable(ecewo_send_file_options_t *opts, bool immutable) {
+  if (opts)
+    opts->immutable = immutable;
+}
+void ecewo_send_file_options_set_etag(ecewo_send_file_options_t *opts, bool etag) {
+  if (opts)
+    opts->etag = etag;
+}
+void ecewo_send_file_options_set_content_type(ecewo_send_file_options_t *opts, const char *content_type) {
+  if (!opts)
+    return;
+  char *copy = NULL;
+  if (content_type) {
+    copy = strdup(content_type);
+    if (!copy)
+      return;
+  }
+  free(opts->content_type);
+  opts->content_type = copy;
+}
+void ecewo_send_file_options_set_root(ecewo_send_file_options_t *opts, const char *root) {
+  if (!opts)
+    return;
+  char *copy = NULL;
+  if (root) {
+    copy = strdup(root);
+    if (!copy)
+      return;
+  }
+  free(opts->root);
+  opts->root = copy;
+}
+void ecewo_send_file_options_set_dotfiles(ecewo_send_file_options_t *opts, bool allow) {
+  if (opts)
+    opts->dotfiles = allow;
+}
+
+// ============================================================================
+// Per-app state
+// ============================================================================
+//
+// All mutable state lives in app_state_t, allocated from the app arena and
+// indexed via ecewo_set/get_app_data keyed by &app_state_key. The struct
+// outlives every request and is freed automatically on app shutdown.
+//
+// All access happens on the event loop thread (handlers, fs callbacks, and
+// ecewo_serve_static() called pre-ecewo_run() from main), so no locking.
+
 typedef struct static_mount_s {
-  char *mount_path;
-  char *dir_path;
+  char *mount_path; // arena-allocated
+  char *dir_path; // arena-allocated
   size_t mount_len;
-  Static options;
+  static_cfg_t cfg;
   struct static_mount_s *next;
 } static_mount_t;
 
 typedef struct {
   static_mount_t *mounts;
   int mount_count;
+} app_state_t;
 
-  // Statistics
-  uint64_t total_requests;
-  uint64_t cache_hits;
-  uint64_t not_found;
-  uint64_t forbidden;
-  uint64_t total_bytes_served;
+static int app_state_key;
 
-  uv_mutex_t mutex;
-  bool initialized;
-  bool owns_fs; // Track if we initialized fs module
-} static_module_state_t;
+static bool g_initialized = false;
+static bool g_owns_fs = false;
 
-static static_module_state_t static_state = { 0 };
+static app_state_t *get_app_state(ecewo_app_t *app) {
+  if (!app)
+    return NULL;
+  return (app_state_t *)ecewo_get_app_data(app, &app_state_key);
+}
+
+static app_state_t *get_or_create_app_state(ecewo_app_t *app) {
+  app_state_t *state = get_app_state(app);
+  if (state)
+    return state;
+
+  ecewo_arena_t *arena = ecewo_app_arena(app);
+  if (!arena)
+    return NULL;
+
+  state = ecewo_alloc(arena, sizeof(*state));
+  if (!state)
+    return NULL;
+
+  memset(state, 0, sizeof(*state));
+  ecewo_set_app_data(app, &app_state_key, state);
+  return state;
+}
 
 // ============================================================================
-// Module Initialization
+// Lifecycle
 // ============================================================================
 
-int static_init(void) {
-  if (static_state.initialized)
+int ecewo_static_init(void) {
+  if (g_initialized)
     return 0;
 
   if (fs_init() != 0) {
     fprintf(stderr, "[ecewo-static] Failed to initialize fs module\n");
     return -1;
   }
-  static_state.owns_fs = true;
-
-  if (uv_mutex_init(&static_state.mutex) != 0) {
-    fprintf(stderr, "[ecewo-static] Failed to initialize mutex\n");
-    return -1;
-  }
-
-  static_state.initialized = true;
+  g_owns_fs = true;
+  g_initialized = true;
   return 0;
 }
 
-void static_cleanup(void) {
-  if (!static_state.initialized)
+void ecewo_static_cleanup(void) {
+  if (!g_initialized)
     return;
 
-  uv_mutex_lock(&static_state.mutex);
-
-  static_mount_t *mount = static_state.mounts;
-  while (mount) {
-    static_mount_t *next = mount->next;
-    free(mount->mount_path);
-    free(mount->dir_path);
-    free(mount);
-    mount = next;
-  }
-
-  static_state.mounts = NULL;
-  static_state.mount_count = 0;
-  static_state.initialized = false;
-
-  bool owns_fs = static_state.owns_fs;
-  static_state.owns_fs = false;
-
-  uv_mutex_unlock(&static_state.mutex);
-  uv_mutex_destroy(&static_state.mutex);
+  bool owns_fs = g_owns_fs;
+  g_owns_fs = false;
+  g_initialized = false;
 
   if (owns_fs)
     fs_cleanup();
 }
 
-void static_get_stats(static_stats_t *stats) {
-  if (!stats || !static_state.initialized)
-    return;
-
-  uv_mutex_lock(&static_state.mutex);
-  stats->mounted_paths = static_state.mount_count;
-  stats->total_requests = static_state.total_requests;
-  stats->cache_hits = static_state.cache_hits;
-  stats->not_found = static_state.not_found;
-  stats->forbidden = static_state.forbidden;
-  stats->total_bytes_served = static_state.total_bytes_served;
-  uv_mutex_unlock(&static_state.mutex);
-}
-
-void static_reset_stats(void) {
-  if (!static_state.initialized)
-    return;
-
-  uv_mutex_lock(&static_state.mutex);
-  static_state.total_requests = 0;
-  static_state.cache_hits = 0;
-  static_state.not_found = 0;
-  static_state.forbidden = 0;
-  static_state.total_bytes_served = 0;
-  uv_mutex_unlock(&static_state.mutex);
-}
-
-SendFile send_file_default_options(void) {
-  SendFile opts = {
-    .max_age = 0, // No caching by default
-    .last_modified = true, // Send Last-Modified
-    .cache_control = true, // Send Cache-Control (if max_age > 0)
-    // .accept_ranges = true, // Support ranges (future feature)
-    .immutable = false, // Not immutable
-    .content_type = NULL, // Auto-detect MIME
-    .root = NULL, // No root (use absolute paths)
-    .dotfiles = "ignore" // Deny dotfiles
-  };
-  return opts;
-}
-
-Static static_default_options(void) {
-  Static opts = {
-    .index = "index.html",
-    .extensions = NULL,
-    .extensions_count = 0,
-    .etag = true, // Generate ETags
-    .max_age = 0, // No caching by default
-    .dotfiles = false,
-    .redirect = true, // Redirect /path to /path/
-    .immutable = false
-  };
-  return opts;
-}
+// ============================================================================
+// Helpers
+// ============================================================================
 
 static bool is_safe_path(const char *path) {
   if (!path || *path == '\0')
     return false;
-
   if (strstr(path, "..") != NULL)
     return false;
-
   if (strstr(path, "//") != NULL)
     return false;
-
-  // Null bytes
-  for (const char *p = path; *p; p++) {
-    if (*p == '\0')
-      return false;
-  }
-
-  // Windows drive letters (C:, D:, etc.)
-  if (path[0] && path[1] == ':')
+  if (path[1] == ':') // Windows drive letter (C:...)
     return false;
-
-  // Absolute paths on Unix
-  if (path[0] == '/' && path[1] == '/')
-    return false;
-
   return true;
 }
 
 static bool is_dotfile(const char *path) {
   if (!path)
     return false;
-
   const char *last_slash = strrchr(path, '/');
   const char *filename = last_slash ? last_slash + 1 : path;
-
   return filename[0] == '.';
-}
-
-static char *generate_etag(Arena *arena, const uv_stat_t *stat) {
-  if (!arena || !stat)
-    return NULL;
-
-  // ETag format: "size-mtime"
-  return arena_sprintf(arena, "\"%lld-%ld\"",
-                       (long long)stat->st_size,
-                       (long)stat->st_mtim.tv_sec);
-}
-
-static bool check_etag_match(const char *if_none_match, const char *etag) {
-  if (!if_none_match || !etag)
-    return false;
-
-  return strcmp(if_none_match, etag) == 0;
-}
-
-typedef struct {
-  Req *req;
-  Res *res;
-  Static options;
-  char *filepath;
-  char *mime_type;
-  char *etag;
-  bool check_etag;
-} static_file_ctx_t;
-
-static void record_request(void) {
-  uv_mutex_lock(&static_state.mutex);
-  static_state.total_requests++;
-  uv_mutex_unlock(&static_state.mutex);
-}
-
-static void record_cache_hit(void) {
-  uv_mutex_lock(&static_state.mutex);
-  static_state.cache_hits++;
-  uv_mutex_unlock(&static_state.mutex);
-}
-
-static void record_not_found(void) {
-  uv_mutex_lock(&static_state.mutex);
-  static_state.not_found++;
-  uv_mutex_unlock(&static_state.mutex);
-}
-
-static void record_forbidden(void) {
-  uv_mutex_lock(&static_state.mutex);
-  static_state.forbidden++;
-  uv_mutex_unlock(&static_state.mutex);
-}
-
-static void record_bytes_served(size_t bytes) {
-  uv_mutex_lock(&static_state.mutex);
-  static_state.total_bytes_served += bytes;
-  uv_mutex_unlock(&static_state.mutex);
 }
 
 static bool should_deny_dotfile(bool allow_dotfiles, const char *filepath) {
   if (!is_dotfile(filepath))
     return false;
-
-  return !allow_dotfiles; // Deny unless explicitly allowed
+  return !allow_dotfiles;
 }
 
-// For send_file_internal (serve_static)
-static void on_file_stat(const char *error, const uv_stat_t *stat, void *user_data);
+static char *generate_etag(ecewo_arena_t *arena, const fs_stat_t *stat) {
+  if (!arena || !stat)
+    return NULL;
+  return ecewo_sprintf(arena, "\"%llu-%lld\"",
+                       (unsigned long long)fs_stat_size(stat),
+                       (long long)fs_stat_mtime_sec(stat));
+}
+
+static bool check_etag_match(const char *if_none_match, const char *etag) {
+  if (!if_none_match || !etag)
+    return false;
+  return strcmp(if_none_match, etag) == 0;
+}
+
+// S_IFDIR bit check, portable without sys/stat.h
+#define IS_DIR_MODE(m) (((m) & 0170000U) == 0040000U)
+
+typedef struct {
+  ecewo_request_t *req;
+  ecewo_response_t *res;
+  static_cfg_t cfg;
+  char *filepath;
+  char *path_stem; // original filepath before any extension suffix is appended
+  int ext_index; // next extension index to try on ENOENT
+  char *mime_type;
+  char *etag;
+} static_file_ctx_t;
+
+static void on_file_stat(const char *error, const fs_stat_t *stat, void *user_data);
 static void on_file_read(const char *error, const char *data, size_t size, void *user_data);
 
-// For send_file()
-static void send_file_on_stat(const char *error, const uv_stat_t *stat, void *user_data);
-static void send_file_on_read(const char *error, const char *data, size_t size, void *user_data);
-
-static void send_file_internal(Req *req, Res *res, const char *filepath, const Static *options, bool check_etag) {
+static void send_file_internal(ecewo_request_t *req,
+                               ecewo_response_t *res,
+                               const char *filepath,
+                               const static_cfg_t *cfg) {
   if (!res || !filepath) {
     if (res)
-      send_text(res, 500, "Internal server error");
+      ecewo_send_text(res, 500, "Internal server error");
     return;
   }
 
   if (!is_safe_path(filepath)) {
-    send_text(res, 403, "Forbidden: Invalid path");
-    record_forbidden();
+    ecewo_send_text(res, 403, "Forbidden: Invalid path");
     return;
   }
 
-  Static opts = options ? *options : static_default_options();
-
-  // Check dotfile access (using new dotfiles string field)
-  if (should_deny_dotfile(opts.dotfiles, filepath)) {
-    send_text(res, 403, "Forbidden: Dotfile access denied");
-    record_forbidden();
+  if (should_deny_dotfile(cfg->dotfiles, filepath)) {
+    ecewo_send_text(res, 403, "Forbidden: Dotfile access denied");
     return;
   }
 
-  static_file_ctx_t *ctx = arena_alloc(res->arena, sizeof(static_file_ctx_t));
+  ecewo_arena_t *arena = ecewo_res_arena(res);
+  static_file_ctx_t *ctx = ecewo_alloc(arena, sizeof(*ctx));
   if (!ctx) {
-    send_text(res, 500, "Memory allocation failed");
+    ecewo_send_text(res, 500, "Memory allocation failed");
     return;
   }
 
   ctx->req = req;
   ctx->res = res;
-  ctx->options = opts;
-  ctx->filepath = arena_strdup(res->arena, filepath);
-  ctx->mime_type = arena_strdup(res->arena, get_mime_type(filepath));
-  ctx->check_etag = check_etag;
+  ctx->cfg = *cfg;
+  ctx->filepath = ecewo_strdup(arena, filepath);
+  ctx->path_stem = ctx->filepath; // extension retrying always starts from here
+  ctx->ext_index = 0;
+  ctx->mime_type = ecewo_strdup(arena, ecewo_static_mime_type(filepath));
   ctx->etag = NULL;
 
   if (!ctx->filepath || !ctx->mime_type) {
-    send_text(res, 500, "Memory allocation failed");
+    ecewo_send_text(res, 500, "Memory allocation failed");
     return;
   }
 
-  record_request();
-
   int result = fs_stat(filepath, on_file_stat, ctx);
   if (result != 0)
-    send_text(res, 503, "Service temporarily unavailable");
+    ecewo_send_text(res, 503, "Service temporarily unavailable");
 }
 
-static void on_file_stat(const char *error, const uv_stat_t *stat, void *user_data) {
-  static_file_ctx_t *ctx = (static_file_ctx_t *)user_data;
-  Res *res = ctx->res;
+static void on_file_stat(const char *error, const fs_stat_t *stat, void *user_data) {
+  static_file_ctx_t *ctx = user_data;
+  ecewo_response_t *res = ctx->res;
+  ecewo_arena_t *arena = ecewo_res_arena(res);
 
   if (error) {
     if (strstr(error, "ENOENT")) {
-      send_text(res, 404, "File not found");
-      record_not_found();
+      // Try next extension fallback before giving up
+      if (ctx->ext_index < ctx->cfg.extensions_count) {
+        const char *ext = ctx->cfg.extensions[ctx->ext_index++];
+        const char *dot = (ext[0] == '.') ? "" : ".";
+        char *new_path = ecewo_sprintf(arena, "%s%s%s", ctx->path_stem, dot, ext);
+        if (new_path) {
+          ctx->filepath = new_path;
+          ctx->mime_type = ecewo_strdup(arena, ecewo_static_mime_type(new_path));
+          ctx->etag = NULL;
+          if (fs_stat(new_path, on_file_stat, ctx) == 0)
+            return;
+        }
+      }
+      ecewo_send_text(res, 404, "File not found");
     } else if (strstr(error, "EACCES")) {
-      send_text(res, 403, "Permission denied");
-      record_forbidden();
+      ecewo_send_text(res, 403, "Permission denied");
     } else {
-      send_text(res, 500, "Internal server error");
+      ecewo_send_text(res, 500, "Internal server error");
     }
     return;
   }
 
-  if (ctx->options.etag) {
-    ctx->etag = generate_etag(res->arena, stat);
+  // Directory handling
+  if (IS_DIR_MODE(fs_stat_mode(stat))) {
+    if (ctx->cfg.redirect) {
+      const char *url_path = ecewo_req_path(ctx->req);
+      char *location = ecewo_sprintf(arena, "%s/", url_path);
+      if (location)
+        ecewo_header_set(res, "Location", location);
+      ecewo_send(res, 301, NULL, 0);
+    } else {
+      // Serve the index file directly; skip ETag since we lack the index's stat
+      char *index_path = ecewo_sprintf(arena, "%s/%s", ctx->filepath, ctx->cfg.index);
+      if (!index_path) {
+        ecewo_send_text(res, 500, "Memory allocation failed");
+        return;
+      }
+      ctx->filepath = index_path;
+      ctx->mime_type = ecewo_strdup(arena, ecewo_static_mime_type(index_path));
+      ctx->cfg.etag = false;
+      if (fs_read_file(ctx->filepath, arena, on_file_read, ctx) != 0)
+        ecewo_send_text(res, 503, "Service temporarily unavailable");
+    }
+    return;
+  }
 
-    if (ctx->check_etag && ctx->etag) {
-      const char *if_none_match = get_header(ctx->req, "If-None-Match");
+  // Regular file - ETag check
+  if (ctx->cfg.etag) {
+    ctx->etag = generate_etag(arena, stat);
+
+    if (ctx->etag) {
+      const char *if_none_match = ecewo_header_get(ctx->req, "If-None-Match");
       if (if_none_match && check_etag_match(if_none_match, ctx->etag)) {
-        set_header(res, "ETag", ctx->etag);
+        ecewo_header_set(res, "ETag", ctx->etag);
 
-        if (ctx->options.max_age > 0) {
-          char *cache_control = arena_sprintf(res->arena,
-                                              ctx->options.immutable
+        if (ctx->cfg.max_age > 0) {
+          char *cache_control = ecewo_sprintf(arena,
+                                              ctx->cfg.immutable
                                                   ? "public, max-age=%d, immutable"
                                                   : "public, max-age=%d",
-                                              ctx->options.max_age);
-          if (cache_control) {
-            set_header(res, "Cache-Control", cache_control);
-          }
+                                              ctx->cfg.max_age);
+          if (cache_control)
+            ecewo_header_set(res, "Cache-Control", cache_control);
         }
 
-        reply(res, 304, NULL, 0);
-        record_cache_hit();
+        ecewo_send(res, 304, NULL, 0);
         return;
       }
     }
   }
 
-  // File exists and not cached - read it
-  int result = fs_read_file(ctx->filepath, res->arena, on_file_read, ctx);
+  int result = fs_read_file(ctx->filepath, arena, on_file_read, ctx);
   if (result != 0)
-    send_text(res, 503, "Service temporarily unavailable");
+    ecewo_send_text(res, 503, "Service temporarily unavailable");
 }
 
 static void on_file_read(const char *error, const char *data, size_t size, void *user_data) {
-  static_file_ctx_t *ctx = (static_file_ctx_t *)user_data;
-  Res *res = ctx->res;
+  static_file_ctx_t *ctx = user_data;
+  ecewo_response_t *res = ctx->res;
 
   if (error) {
     if (strstr(error, "ENOENT")) {
-      send_text(res, 404, "File not found");
-      record_not_found();
+      ecewo_send_text(res, 404, "File not found");
     } else if (strstr(error, "EACCES")) {
-      send_text(res, 403, "Permission denied");
-      record_forbidden();
+      ecewo_send_text(res, 403, "Permission denied");
     } else {
-      send_text(res, 500, "Internal server error");
+      ecewo_send_text(res, 500, "Internal server error");
     }
     return;
   }
 
-  // Success - send file with all headers
+  ecewo_arena_t *arena = ecewo_res_arena(res);
 
-  set_header(res, "Content-Type", ctx->mime_type);
+  ecewo_header_set(res, "Content-Type", ctx->mime_type);
 
-  if (ctx->options.etag && ctx->etag)
-    set_header(res, "ETag", ctx->etag);
+  if (ctx->cfg.etag && ctx->etag)
+    ecewo_header_set(res, "ETag", ctx->etag);
 
-  if (ctx->options.max_age > 0) {
-    char *cache_control = arena_sprintf(res->arena,
-                                        ctx->options.immutable
+  if (ctx->cfg.max_age > 0) {
+    char *cache_control = ecewo_sprintf(arena,
+                                        ctx->cfg.immutable
                                             ? "public, max-age=%d, immutable"
                                             : "public, max-age=%d",
-                                        ctx->options.max_age);
+                                        ctx->cfg.max_age);
     if (cache_control)
-      set_header(res, "Cache-Control", cache_control);
+      ecewo_header_set(res, "Cache-Control", cache_control);
   }
 
-  // Data is in res->arena
-  record_bytes_served(size);
-  reply(res, 200, data, size);
+  ecewo_send(res, 200, data, size);
 }
 
 typedef struct {
-  Res *res;
-  SendFile options;
+  ecewo_request_t *req;
+  ecewo_response_t *res;
+  send_cfg_t cfg;
   char *resolved_path;
   char *mime_type;
-  time_t mtime;
+  int64_t mtime;
+  char *etag_value;
 } send_file_ctx;
 
-static void send_file_on_stat(const char *error, const uv_stat_t *stat, void *user_data) {
-  send_file_ctx *ctx = (send_file_ctx *)user_data;
-  Res *res = ctx->res;
+static void send_file_on_read(const char *error, const char *data, size_t size, void *user_data);
+
+static void send_file_on_stat(const char *error, const fs_stat_t *stat, void *user_data) {
+  send_file_ctx *ctx = user_data;
+  ecewo_response_t *res = ctx->res;
 
   if (error) {
-    if (strstr(error, "ENOENT") || strstr(error, "no such file")) {
-      send_text(res, 404, "File not found");
-      record_not_found();
-    } else if (strstr(error, "EACCES") || strstr(error, "permission denied")) {
-      send_text(res, 403, "Permission denied");
-      record_forbidden();
-    } else {
-      send_text(res, 500, "Internal server error");
-    }
+    if (strstr(error, "ENOENT") || strstr(error, "no such file"))
+      ecewo_send_text(res, 404, "File not found");
+    else if (strstr(error, "EACCES") || strstr(error, "permission denied"))
+      ecewo_send_text(res, 403, "Permission denied");
+    else
+      ecewo_send_text(res, 500, "Internal server error");
     return;
   }
 
-  // Store mtime for Last-Modified header
-  ctx->mtime = stat->st_mtim.tv_sec;
+  ctx->mtime = fs_stat_mtime_sec(stat);
+  ecewo_arena_t *arena = ecewo_res_arena(res);
 
-  int result = fs_read_file(ctx->resolved_path, res->arena, send_file_on_read, ctx);
+  if (ctx->cfg.etag) {
+    ctx->etag_value = ecewo_sprintf(arena, "\"%llu-%lld\"",
+                                    (unsigned long long)fs_stat_size(stat),
+                                    (long long)ctx->mtime);
+
+    if (ctx->etag_value && ctx->req) {
+      const char *if_none_match = ecewo_header_get(ctx->req, "If-None-Match");
+      if (if_none_match && strcmp(if_none_match, ctx->etag_value) == 0) {
+        ecewo_header_set(res, "ETag", ctx->etag_value);
+        if (ctx->cfg.cache_control && ctx->cfg.max_age > 0) {
+          char *cc = ecewo_sprintf(arena,
+                                   ctx->cfg.immutable
+                                       ? "public, max-age=%d, immutable"
+                                       : "public, max-age=%d",
+                                   ctx->cfg.max_age);
+          if (cc)
+            ecewo_header_set(res, "Cache-Control", cc);
+        }
+        ecewo_send(res, 304, NULL, 0);
+        return;
+      }
+    }
+  }
+
+  int result = fs_read_file(ctx->resolved_path, arena, send_file_on_read, ctx);
   if (result != 0)
-    send_text(res, 503, "Service temporarily unavailable");
+    ecewo_send_text(res, 503, "Service temporarily unavailable");
 }
 
 static void send_file_on_read(const char *error, const char *data, size_t size, void *user_data) {
-  send_file_ctx *ctx = (send_file_ctx *)user_data;
-  Res *res = ctx->res;
+  send_file_ctx *ctx = user_data;
+  ecewo_response_t *res = ctx->res;
 
   if (error) {
-    if (strstr(error, "ENOENT") || strstr(error, "no such file")) {
-      send_text(res, 404, "File not found");
-      record_not_found();
-    } else if (strstr(error, "EACCES") || strstr(error, "permission denied")) {
-      send_text(res, 403, "Permission denied");
-      record_forbidden();
-    } else {
-      send_text(res, 500, "Internal server error");
-    }
+    if (strstr(error, "ENOENT") || strstr(error, "no such file"))
+      ecewo_send_text(res, 404, "File not found");
+    else if (strstr(error, "EACCES") || strstr(error, "permission denied"))
+      ecewo_send_text(res, 403, "Permission denied");
+    else
+      ecewo_send_text(res, 500, "Internal server error");
     return;
   }
 
-  set_header(res, "Content-Type", ctx->mime_type);
+  ecewo_arena_t *arena = ecewo_res_arena(res);
 
-  if (ctx->options.last_modified) {
+  ecewo_header_set(res, "Content-Type", ctx->mime_type);
+
+  if (ctx->cfg.etag && ctx->etag_value)
+    ecewo_header_set(res, "ETag", ctx->etag_value);
+
+  if (ctx->cfg.last_modified) {
     char date_buf[128];
     struct tm tm;
+    time_t mtime = (time_t)ctx->mtime;
 #ifdef _WIN32
-    gmtime_s(&tm, &ctx->mtime);
+    gmtime_s(&tm, &mtime);
 #else
-    gmtime_r(&ctx->mtime, &tm);
+    gmtime_r(&mtime, &tm);
 #endif
     strftime(date_buf, sizeof(date_buf), "%a, %d %b %Y %H:%M:%S GMT", &tm);
-    set_header(res, "Last-Modified", date_buf);
+    ecewo_header_set(res, "Last-Modified", date_buf);
   }
 
-  if (ctx->options.cache_control && ctx->options.max_age > 0) {
-    char *cache_control = arena_sprintf(res->arena,
-                                        ctx->options.immutable
+  if (ctx->cfg.cache_control && ctx->cfg.max_age > 0) {
+    char *cache_control = ecewo_sprintf(arena,
+                                        ctx->cfg.immutable
                                             ? "public, max-age=%d, immutable"
                                             : "public, max-age=%d",
-                                        ctx->options.max_age);
-    if (cache_control) {
-      set_header(res, "Cache-Control", cache_control);
-    }
+                                        ctx->cfg.max_age);
+    if (cache_control)
+      ecewo_header_set(res, "Cache-Control", cache_control);
   }
 
-  // Data is in res->arena
-  record_bytes_served(size);
-  reply(res, 200, data, size);
+  ecewo_send(res, 200, data, size);
 }
 
-void send_file(Res *res, const char *filepath, const SendFile *options) {
-  if (!res || !filepath) {
+void ecewo_send_file(ecewo_request_t *req,
+                     ecewo_response_t *res,
+                     const char *filepath,
+                     const ecewo_send_file_options_t *options) {
+  if (!g_initialized) {
     if (res)
-      send_text(res, 500, "Invalid arguments");
+      ecewo_send_text(res, 503, "Static module not initialized");
     return;
   }
 
-  // Apply defaults
-  SendFile opts = options ? *options : send_file_default_options();
+  if (!res || !filepath) {
+    if (res)
+      ecewo_send_text(res, 500, "Invalid arguments");
+    return;
+  }
 
-  // Build resolved path (handle root directory)
+  // Snapshot caller-provided opts into a local POD; defaults if NULL.
+  send_cfg_t cfg = {
+    .max_age = 0,
+    .last_modified = true,
+    .cache_control = true,
+    .immutable = false,
+    .etag = true,
+    .content_type = NULL,
+    .root = NULL,
+    .dotfiles = false
+  };
+  if (options) {
+    cfg.max_age = options->max_age;
+    cfg.last_modified = options->last_modified;
+    cfg.cache_control = options->cache_control;
+    cfg.immutable = options->immutable;
+    cfg.etag = options->etag;
+    cfg.content_type = options->content_type;
+    cfg.root = options->root;
+    cfg.dotfiles = options->dotfiles;
+  }
+
   char resolved_path[2048];
-  if (opts.root && filepath[0] != '/') {
-    // Relative path with root
-    snprintf(resolved_path, sizeof(resolved_path), "%s/%s", opts.root, filepath);
+  if (cfg.root && filepath[0] != '/') {
+    snprintf(resolved_path, sizeof(resolved_path), "%s/%s", cfg.root, filepath);
   } else {
-    // Absolute path or no root
     strncpy(resolved_path, filepath, sizeof(resolved_path) - 1);
     resolved_path[sizeof(resolved_path) - 1] = '\0';
   }
 
   if (!is_safe_path(resolved_path)) {
-    send_text(res, 403, "Forbidden: Invalid path");
-    record_forbidden();
+    ecewo_send_text(res, 403, "Forbidden: Invalid path");
     return;
   }
 
-  if (should_deny_dotfile(opts.dotfiles, resolved_path)) {
-    send_text(res, 403, "Forbidden: Dotfile access denied");
-    record_forbidden();
+  if (should_deny_dotfile(cfg.dotfiles, resolved_path)) {
+    ecewo_send_text(res, 403, "Forbidden: Dotfile access denied");
     return;
   }
 
-  record_request();
-
-  send_file_ctx *ctx = arena_alloc(res->arena, sizeof(send_file_ctx));
+  ecewo_arena_t *arena = ecewo_res_arena(res);
+  send_file_ctx *ctx = ecewo_alloc(arena, sizeof(*ctx));
   if (!ctx) {
-    send_text(res, 500, "Memory allocation failed");
+    ecewo_send_text(res, 500, "Memory allocation failed");
     return;
   }
 
+  ctx->req = req;
   ctx->res = res;
-  ctx->options = opts;
-  ctx->resolved_path = arena_strdup(res->arena, resolved_path);
+  ctx->cfg = cfg;
+  ctx->etag_value = NULL;
+  ctx->resolved_path = ecewo_strdup(arena, resolved_path);
 
-  if (opts.content_type) {
-    ctx->mime_type = arena_strdup(res->arena, opts.content_type);
-  } else {
-    ctx->mime_type = arena_strdup(res->arena, get_mime_type(resolved_path));
-  }
+  if (cfg.content_type)
+    ctx->mime_type = ecewo_strdup(arena, cfg.content_type);
+  else
+    ctx->mime_type = ecewo_strdup(arena, ecewo_static_mime_type(resolved_path));
 
   if (!ctx->resolved_path || !ctx->mime_type) {
-    send_text(res, 500, "Memory allocation failed");
+    ecewo_send_text(res, 500, "Memory allocation failed");
     return;
   }
 
-  // Stat file first to get mtime for Last-Modified
-  int result = fs_stat(resolved_path, send_file_on_stat, ctx);
+  int result = fs_stat(ctx->resolved_path, send_file_on_stat, ctx);
   if (result != 0)
-    send_text(res, 503, "Service temporarily unavailable");
+    ecewo_send_text(res, 503, "Service temporarily unavailable");
 }
 
-static void static_handler(Req *req, Res *res) {
-  const char *url_path = req->path;
+static void static_handler(ecewo_request_t *req, ecewo_response_t *res) {
+  ecewo_app_t *app = ecewo_req_app(req);
+  app_state_t *state = get_app_state(app);
 
-  uv_mutex_lock(&static_state.mutex);
-
-  static_mount_t *mount = static_state.mounts;
-  static_mount_t *matched_mount = NULL;
-
-  while (mount) {
-    if (strncmp(url_path, mount->mount_path, mount->mount_len) == 0) {
-      matched_mount = mount;
-      break;
-    }
-    mount = mount->next;
-  }
-
-  if (!matched_mount) {
-    uv_mutex_unlock(&static_state.mutex);
-    send_text(res, 404, "Not found");
-    record_not_found();
+  if (!state) {
+    ecewo_send_text(res, 404, "Not found");
     return;
   }
 
-  char dir_path[1024];
-  char mount_path[256];
-  Static opts = matched_mount->options;
-  size_t mount_len = matched_mount->mount_len;
+  const char *url_path = ecewo_req_path(req);
+  static_mount_t *matched = NULL;
+  size_t best_len = 0;
 
-  strncpy(dir_path, matched_mount->dir_path, sizeof(dir_path) - 1);
-  dir_path[sizeof(dir_path) - 1] = '\0';
+  for (static_mount_t *m = state->mounts; m; m = m->next) {
+    if (strncmp(url_path, m->mount_path, m->mount_len) != 0)
+      continue;
+    if (m->mount_len > best_len) {
+      matched = m;
+      best_len = m->mount_len;
+    }
+  }
 
-  strncpy(mount_path, matched_mount->mount_path, sizeof(mount_path) - 1);
-  mount_path[sizeof(mount_path) - 1] = '\0';
+  if (!matched) {
+    ecewo_send_text(res, 404, "Not found");
+    return;
+  }
 
-  uv_mutex_unlock(&static_state.mutex);
+  static_cfg_t cfg = matched->cfg;
+  size_t mount_len = matched->mount_len;
+  const char *dir_path = matched->dir_path;
 
   const char *rel_path = url_path + mount_len;
   if (*rel_path == '/')
     rel_path++;
 
-  if (should_deny_dotfile(opts.dotfiles, rel_path)) {
-    send_text(res, 403, "Forbidden: Dotfile access denied");
-    record_forbidden();
+  if (should_deny_dotfile(cfg.dotfiles, rel_path)) {
+    ecewo_send_text(res, 403, "Forbidden: Dotfile access denied");
     return;
   }
 
   char filepath[2048];
 
+  // URL already targets a directory (trailing slash or root)
+  // Serve index directly without redirect or extension fallback.
   bool is_dir = (*rel_path == '\0' || rel_path[strlen(rel_path) - 1] == '/');
 
   if (is_dir) {
-    if (*rel_path == '\0') {
-      snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, opts.index);
-    } else {
-      snprintf(filepath, sizeof(filepath), "%s/%s%s", dir_path, rel_path, opts.index);
+    if (*rel_path == '\0')
+      snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, cfg.index);
+    else
+      snprintf(filepath, sizeof(filepath), "%s/%s%s", dir_path, rel_path, cfg.index);
+
+    if (!is_safe_path(filepath)) {
+      ecewo_send_text(res, 403, "Forbidden: Invalid path");
+      return;
     }
+
+    // Strip redirect and extensions. The index path is already fully resolved.
+    static_cfg_t dir_cfg = cfg;
+    dir_cfg.redirect = false;
+    dir_cfg.extensions = NULL;
+    dir_cfg.extensions_count = 0;
+    send_file_internal(req, res, filepath, &dir_cfg);
   } else {
+    // URL targets a file or possibly an un-slashed directory.
+    // Pass the raw path; on_file_stat handles redirect if it turns out to be a dir.
     snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, rel_path);
-  }
 
-  if (!is_safe_path(filepath)) {
-    send_text(res, 403, "Forbidden: Invalid path");
-    record_forbidden();
-    return;
-  }
+    if (!is_safe_path(filepath)) {
+      ecewo_send_text(res, 403, "Forbidden: Invalid path");
+      return;
+    }
 
-  send_file_internal(req, res, filepath, &opts, true);
+    send_file_internal(req, res, filepath, &cfg);
+  }
 }
 
-int serve_static(const char *mount_path, const char *dir_path, const Static *options) {
-  if (!mount_path || !dir_path) {
+int ecewo_serve_static(ecewo_app_t *app,
+                       const char *mount_path,
+                       const char *dir_path,
+                       const ecewo_static_options_t *options) {
+  if (!app || !mount_path || !dir_path) {
     fprintf(stderr, "[ecewo-static] Invalid arguments\n");
     return -1;
   }
 
-  if (!static_state.initialized) {
-    fprintf(stderr, "[ecewo-static] Module not initialized - call static_init() first\n");
+  if (!g_initialized) {
+    fprintf(stderr, "[ecewo-static] Module not initialized - call ecewo_static_init() first\n");
     return -1;
   }
 
-  Static opts = options ? *options : static_default_options();
-
-  if (!opts.index || *opts.index == '\0') {
-    opts.index = "index.html";
+  app_state_t *state = get_or_create_app_state(app);
+  if (!state) {
+    fprintf(stderr, "[ecewo-static] Failed to allocate per-app state\n");
+    return -1;
   }
 
-  uv_mutex_lock(&static_state.mutex);
+  // Snapshot user-provided opts into a POD config; defaults if NULL.
+  static_cfg_t cfg;
+  const char *index_src;
+  if (options) {
+    cfg.etag = options->etag;
+    cfg.max_age = options->max_age;
+    cfg.dotfiles = options->dotfiles;
+    cfg.redirect = options->redirect;
+    cfg.immutable = options->immutable;
+    index_src = (options->index && *options->index) ? options->index : "index.html";
+  } else {
+    cfg.etag = true;
+    cfg.max_age = 0;
+    cfg.dotfiles = false;
+    cfg.redirect = true;
+    cfg.immutable = false;
+    index_src = "index.html";
+  }
+  cfg.extensions = NULL;
+  cfg.extensions_count = 0;
 
-  static_mount_t *existing = static_state.mounts;
-  while (existing) {
-    if (strcmp(existing->mount_path, mount_path) == 0) {
-      uv_mutex_unlock(&static_state.mutex);
+  for (static_mount_t *e = state->mounts; e; e = e->next) {
+    if (strcmp(e->mount_path, mount_path) == 0) {
       fprintf(stderr, "[ecewo-static] Mount path '%s' already exists\n", mount_path);
       return -1;
     }
-    existing = existing->next;
   }
 
-  static_mount_t *mount = calloc(1, sizeof(static_mount_t));
-  if (!mount) {
-    uv_mutex_unlock(&static_state.mutex);
+  ecewo_arena_t *arena = ecewo_app_arena(app);
+
+  // Arena-copy extensions so cfg.extensions outlives the options object.
+  if (options && options->extensions && options->extensions_count > 0) {
+    int count = options->extensions_count;
+    char **ext_arr = ecewo_alloc(arena, (size_t)count * sizeof(char *));
+    if (!ext_arr)
+      return -1;
+    for (int i = 0; i < count; i++) {
+      ext_arr[i] = ecewo_strdup(arena, options->extensions[i]);
+      if (!ext_arr[i])
+        return -1;
+    }
+    cfg.extensions = ext_arr;
+    cfg.extensions_count = count;
+  }
+
+  static_mount_t *mount = ecewo_alloc(arena, sizeof(*mount));
+  if (!mount)
     return -1;
-  }
 
-  mount->mount_path = strdup(mount_path);
-  mount->dir_path = strdup(dir_path);
+  memset(mount, 0, sizeof(*mount));
+  mount->mount_path = ecewo_strdup(arena, mount_path);
+  mount->dir_path = ecewo_strdup(arena, dir_path);
   mount->mount_len = strlen(mount_path);
-  mount->options = opts;
+  mount->cfg = cfg;
+  mount->cfg.index = ecewo_strdup(arena, index_src);
 
-  if (!mount->mount_path || !mount->dir_path) {
-    free(mount->mount_path);
-    free(mount->dir_path);
-    free(mount);
-    uv_mutex_unlock(&static_state.mutex);
+  if (!mount->mount_path || !mount->dir_path || !mount->cfg.index)
     return -1;
-  }
 
-  mount->next = static_state.mounts;
-  static_state.mounts = mount;
-  static_state.mount_count++;
+  mount->next = state->mounts;
+  state->mounts = mount;
+  state->mount_count++;
 
-  uv_mutex_unlock(&static_state.mutex);
-
-  get(mount_path, static_handler);
+  ECEWO_GET(app, mount_path, static_handler);
 
   char wildcard[512];
-  if (mount_path[strlen(mount_path) - 1] == '/') {
+  if (mount_path[strlen(mount_path) - 1] == '/')
     snprintf(wildcard, sizeof(wildcard), "%s*", mount_path);
-  } else {
+  else
     snprintf(wildcard, sizeof(wildcard), "%s/*", mount_path);
-  }
-  get(wildcard, static_handler);
+  ECEWO_GET(app, wildcard, static_handler);
 
   return 0;
 }

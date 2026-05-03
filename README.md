@@ -1,6 +1,6 @@
 # Static File Serving
 
-ecewo provides a comprehensive static file serving module with automatic MIME type detection, ETag-based caching, security features, and express.js-compatible APIs. Built on top of [`ecewo-fs`](https://github.com/ecewo/ecewo-fs).
+ecewo-static is a static file serving plugin for [ecewo](https://github.com/ecewo/ecewo) with automatic MIME type detection, ETag-based caching, directory redirect, extension fallback, and security features. Built on top of [`ecewo-fs`](https://github.com/ecewo/ecewo-fs).
 
 ## Table of Contents
 
@@ -9,29 +9,31 @@ ecewo provides a comprehensive static file serving module with automatic MIME ty
 3. [Project Structure](#project-structure)
     1. [CMake Static Files Setup](#cmake-static-files-setup)
 4. [API Reference](#api-reference)
-    1. [`serve_static()`](#serve_static)
-    2. [`send_file()`](#send_file)
-    3. [`get_mime_type()`](#get_mime_type)
+    1. [`ecewo_serve_static()`](#ecewo_serve_static)
+    2. [`ecewo_send_file()`](#ecewo_send_file)
+    3. [`ecewo_static_mime_type()`](#ecewo_static_mime_type)
 5. [Configuration Options](#configuration-options)
-    1. [Static](#Static)
-    2. [SendFile](#SendFile)
+    1. [serve_static options](#serve_static-options)
+    2. [send_file options](#send_file-options)
 6. [Features](#features)
     1. [Automatic MIME Type Detection](#automatic-mime-type-detection)
     2. [ETag Caching](#etag-caching)
     3. [Cache Control](#cache-control)
     4. [Security Features](#security-features)
     5. [Index Files](#index-files)
-7. [Statistics & Monitoring](#statistics--monitoring)
-8. [Advanced Examples](#advanced-examples)
+    6. [Directory Redirect](#directory-redirect)
+    7. [Extension Fallback](#extension-fallback)
+7. [Advanced Examples](#advanced-examples)
+8. [Limitations](#limitations)
 
 ## Installation
 
 Add to your `CMakeLists.txt`:
 
-```sh
-ecewo_plugins(
-    fs
-    static
+```cmake
+ecewo_add(
+    fs@v0.2.0
+    static@v0.2.0
 )
 
 target_link_libraries(app PRIVATE
@@ -48,22 +50,18 @@ Initialize the static module in your application:
 #include "ecewo-static.h"
 
 int main(void) {
-    server_init();
-    
-    // Initialize static file serving module
-    // (automatically initializes ecewo-fs internally)
-    if (static_init() != 0) {
+    ecewo_app_t *app = ecewo_create();
+
+    // Initialize static file serving (also initializes ecewo-fs internally)
+    if (ecewo_static_init() != 0) {
         fprintf(stderr, "Failed to initialize static module\n");
         return 1;
     }
-    
-    // Your routes and static file serving...
-    
-    // Register cleanup handler (also cleans up fs module)
-    server_atexit(static_cleanup);
-    
-    server_listen(3000);
-    server_run();
+
+    // Your routes and static mounts...
+
+    ecewo_atexit(app, ecewo_static_cleanup);
+    ecewo_listen(app, 3000);
     return 0;
 }
 ```
@@ -77,28 +75,25 @@ int main(void) {
 #include "ecewo-static.h"
 
 int main(void) {
-    server_init();
-    static_init();  // Automatically initializes ecewo-fs
-    
-    // Serve ./public directory at root URL
-    if (serve_static("/", "./public", NULL) != 0) {
+    ecewo_app_t *app = ecewo_create();
+    ecewo_static_init();
+
+    // Serve ./public at the root URL
+    if (ecewo_serve_static(app, "/", "./public", NULL) != 0) {
         fprintf(stderr, "Failed to mount static directory\n");
         return 1;
     }
-    
+
     /*
-     * Now these URLs work automatically:
      * GET /               -> ./public/index.html
      * GET /about.html     -> ./public/about.html
      * GET /css/style.css  -> ./public/css/style.css
      * GET /js/app.js      -> ./public/js/app.js
      * GET /img/logo.png   -> ./public/img/logo.png
      */
-    
-    server_atexit(static_cleanup);  // Also cleans up fs module
-    
-    server_listen(3000);
-    server_run();
+
+    ecewo_atexit(app, ecewo_static_cleanup);
+    ecewo_listen(app, 3000);
     return 0;
 }
 ```
@@ -106,29 +101,26 @@ int main(void) {
 ### Single File Serving
 
 ```c
-void download_handler(Req *req, Res *res) {
-    const char *filename = get_query(req, "file");
-    
+void download_handler(ecewo_request_t *req, ecewo_response_t *res) {
+    const char *filename = ecewo_query(req, "file");
+
     if (!filename) {
-        send_text(res, 400, "Missing file parameter");
+        ecewo_send_text(res, 400, "Missing file parameter");
         return;
     }
-    
-    char *filepath = arena_sprintf(req->arena, "downloads/%s", filename);
-    
-    // Send the file with default options
-    send_file(res, filepath, NULL);
+
+    char *filepath = ecewo_sprintf(ecewo_req_arena(req), "downloads/%s", filename);
+    ecewo_send_file(req, res, filepath, NULL);
 }
 
 int main(void) {
-    server_init();
-    static_init();  // Automatically initializes ecewo-fs
-    
-    get("/download", download_handler);
-    
-    server_atexit(static_cleanup);
-    server_listen(3000);
-    server_run();
+    ecewo_app_t *app = ecewo_create();
+    ecewo_static_init();
+
+    ECEWO_GET(app, "/download", download_handler);
+
+    ecewo_atexit(app, ecewo_static_cleanup);
+    ecewo_listen(app, 3000);
     return 0;
 }
 ```
@@ -166,9 +158,7 @@ your-project/
 Add this to your `CMakeLists.txt` to automatically copy/symlink the `public/` directory:
 
 ```cmake
-# Platform-aware public directory handling
 if(WIN32)
-    # Windows: Copy directory (symlinks require admin privileges)
     add_custom_command(TARGET server POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_SOURCE_DIR}/public
@@ -176,7 +166,6 @@ if(WIN32)
         COMMENT "Copying public directory to build folder"
     )
 else()
-    # Linux/Mac: Create symlink (faster, no duplication)
     add_custom_command(TARGET server POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E create_symlink
             ${CMAKE_SOURCE_DIR}/public
@@ -186,431 +175,347 @@ else()
 endif()
 ```
 
-**What this does:**
-
-- **Windows:** Copies `public/` -> `build/public/` on every build
-- **Linux/Mac:** Creates symlink `build/public/` -> `../public/` (one-time)
-
-Server can be run from either project root or build directory.
+- **Windows:** Copies `public/` → `build/public/` on every build
+- **Linux/Mac:** Creates symlink `build/public/` → `../public/` (one-time)
 
 ## API Reference
 
-### `serve_static()`
+### `ecewo_serve_static()`
 
-Mount a directory to serve static files from a URL path.
+Mount a directory to serve static files from a URL prefix.
 
 ```c
-int serve_static(
+int ecewo_serve_static(
+    ecewo_app_t *app,
     const char *mount_path,
     const char *dir_path,
-    const Static *options
+    const ecewo_static_options_t *options
 );
 ```
 
 **Parameters:**
 
+- `app`: The ecewo application instance
 - `mount_path`: URL prefix (e.g., `"/"`, `"/static"`, `"/assets"`)
-- `dir_path`: Filesystem directory path (e.g., `"./public"`, `"/var/www"`)
-- `options`: Configuration options (`NULL` for defaults)
+- `dir_path`: Filesystem directory to serve (e.g., `"./public"`, `"/var/www"`)
+- `options`: Configuration options (`NULL` for defaults). Caller may free after the call.
 
-**Returns:**
-- `0` on success
-- `-1` on failure (e.g., mount already exists, invalid arguments)
+**Returns:** `0` on success, `-1` on failure (mount already exists, allocation failure, etc.)
 
-**URL Mapping Examples:**
+**URL mapping examples:**
 
 ```c
-// Mount at root
-serve_static("/", "./public", NULL);
+ecewo_serve_static(app, "/", "./public", NULL);
 // GET /style.css       -> ./public/style.css
 // GET /js/app.js       -> ./public/js/app.js
 // GET /img/logo.png    -> ./public/img/logo.png
 
-// Mount at /static
-serve_static("/static", "./assets", NULL);
+ecewo_serve_static(app, "/static", "./assets", NULL);
 // GET /static/style.css    -> ./assets/style.css
 // GET /static/logo.png     -> ./assets/logo.png
 
-// Mount at /cdn
-serve_static("/cdn", "./dist", NULL);
+ecewo_serve_static(app, "/cdn", "./dist", NULL);
 // GET /cdn/bundle.js       -> ./dist/bundle.js
 ```
 
-**Example with options:**
+**With options:**
 
 ```c
-Static opts = {
-    .index = "home.html",       // Custom index file
-    .extensions = NULL,         // No extension fallback
-    .extensions_count = 0,
-    .etag = true,               // Enable ETag caching
-    .max_age = 86400,           // Cache for 1 day
-    .dotfiles = false,          // Deny dotfiles (recommended)
-    .redirect = true,           // Redirect /path to /path/
-    .immutable = false          // Not immutable
-};
+ecewo_static_options_t *opts = ecewo_static_options_new();
+ecewo_static_options_set_index(opts, "home.html");
+ecewo_static_options_set_etag(opts, true);
+ecewo_static_options_set_max_age(opts, 86400);
 
-serve_static("/", "./public", &opts);
+ecewo_serve_static(app, "/", "./public", opts);
+ecewo_static_options_free(opts);
 ```
 
-### `send_file()`
+### `ecewo_send_file()`
 
-Send a single file as HTTP response. Matches Express.js `res.sendFile()` API.
+Send a single file as the HTTP response. Equivalent to Express.js `res.sendFile()`.
 
 ```c
-void send_file(
-    Res *res,
+void ecewo_send_file(
+    ecewo_request_t *req,
+    ecewo_response_t *res,
     const char *filepath,
-    const SendFile *options
+    const ecewo_send_file_options_t *options
 );
 ```
 
 **Parameters:**
 
-- `res`: Response object
-- `filepath`: File path (absolute or relative to `options.root`)
-- `options`: Send options (`NULL` for defaults)
+- `req`: The request object (used for `If-None-Match` ETag validation)
+- `res`: The response object
+- `filepath`: File path, absolute or relative to `options` root
+- `options`: Send options (`NULL` for defaults). Caller may free after the call.
 
 **Automatically handles:**
-- MIME type detection
+- MIME type detection from file extension
 - `Content-Type` header
+- `ETag` header + `304 Not Modified` on match
 - `Last-Modified` header
 - `Cache-Control` header
 - Dotfile access control
-- 404 if file not found
-- 403 if permission denied
+- `404` if file not found, `403` if permission denied
 
 **Basic example:**
 
 ```c
-void report_handler(Req *req, Res *res) {
-    send_file(res, "/data/report.pdf", NULL);
+void report_handler(ecewo_request_t *req, ecewo_response_t *res) {
+    ecewo_send_file(req, res, "/data/report.pdf", NULL);
 }
 ```
 
-**With caching:**
+**With long-term caching:**
 
 ```c
-void asset_handler(Req *req, Res *res) {
-    SendFile opts = {
-        .max_age = 31536000,        // 1 year
-        .immutable = true,          // Asset never changes
-        .cache_control = true,
-        .last_modified = true,
-        .content_type = NULL,       // Auto-detect
-        .root = NULL,
-        .dotfiles = false
-    };
-    
-    send_file(res, "/assets/app.v123.js", &opts);
+void asset_handler(ecewo_request_t *req, ecewo_response_t *res) {
+    ecewo_send_file_options_t *opts = ecewo_send_file_options_new();
+    ecewo_send_file_options_set_max_age(opts, 31536000);   // 1 year
+    ecewo_send_file_options_set_immutable(opts, true);
     // Cache-Control: public, max-age=31536000, immutable
+
+    ecewo_send_file(req, res, "/assets/app.v123.js", opts);
+    ecewo_send_file_options_free(opts);
 }
 ```
 
 **With root directory:**
 
 ```c
-void download_handler(Req *req, Res *res) {
-    const char *filename = get_param(req, "filename");
-    
-    SendFile opts = {
-        .root = "/var/downloads",   // Base directory
-        .max_age = 0,               // No caching
-        .dotfiles = false           // Block dotfiles
-    };
-    
-    // Serves /var/downloads/report.pdf
-    send_file(res, "report.pdf", &opts);
+void download_handler(ecewo_request_t *req, ecewo_response_t *res) {
+    const char *filename = ecewo_param(req, "filename");
+
+    ecewo_send_file_options_t *opts = ecewo_send_file_options_new();
+    ecewo_send_file_options_set_root(opts, "/var/downloads");
+
+    // Serves /var/downloads/<filename>
+    ecewo_send_file(req, res, filename, opts);
+    ecewo_send_file_options_free(opts);
 }
 ```
 
 **Custom MIME type:**
 
 ```c
-void binary_handler(Req *req, Res *res) {
-    SendFile opts = {
-        .content_type = "application/octet-stream",
-        .dotfiles = false
-    };
-    
-    send_file(res, "/data/file.bin", &opts);
+void binary_handler(ecewo_request_t *req, ecewo_response_t *res) {
+    ecewo_send_file_options_t *opts = ecewo_send_file_options_new();
+    ecewo_send_file_options_set_content_type(opts, "application/octet-stream");
+
+    ecewo_send_file(req, res, "/data/file.bin", opts);
+    ecewo_send_file_options_free(opts);
 }
 ```
 
-### `get_mime_type()`
+### `ecewo_static_mime_type()`
 
-Get MIME type for a file extension.
+Look up the MIME type for a file path or extension.
 
 ```c
-const char *get_mime_type(const char *path);
+const char *ecewo_static_mime_type(const char *path);
 ```
 
 **Parameters:**
 
-- `path`: File path or extension (e.g., `"file.js"` or `".js"`)
+- `path`: File path or bare extension (e.g., `"app.js"` or `".js"`)
 
-**Returns:** MIME type string (never `NULL`, returns `"application/octet-stream"` for unknown types)
+**Returns:** MIME type string; never `NULL`. Unknown extensions return `"application/octet-stream"`.
 
 **Example:**
 
 ```c
-const char *mime = get_mime_type("app.js");
-// Returns: "application/javascript; charset=utf-8"
-
-mime = get_mime_type(".png");
-// Returns: "image/png"
-
-mime = get_mime_type("unknown.xyz");
-// Returns: "application/octet-stream"
+ecewo_static_mime_type("app.js");      // "application/javascript; charset=utf-8"
+ecewo_static_mime_type(".png");        // "image/png"
+ecewo_static_mime_type("unknown.xyz"); // "application/octet-stream"
 ```
 
 ## Configuration Options
 
-### Static
+All option objects are opaque. Create with `_new()`, configure with setters, pass to the function, then free with `_free()`. The library copies everything it needs at the call site, so options can be freed immediately after.
 
-Options for `serve_static()` - matches Express.js `express.static()`:
+### serve_static options
 
 ```c
-typedef struct {
-    const char *index;          // Index file name
-    const char **extensions;    // Extension fallbacks
-    int extensions_count;       // Number of extensions
-    bool etag;                  // Generate ETags
-    int max_age;                // Cache duration (seconds)
-    bool dotfiles;              // Allow dotfiles
-    bool redirect;              // Redirect /path to /path/
-    bool immutable;             // Add immutable directive
-} Static;
+ecewo_static_options_t *opts = ecewo_static_options_new();
 ```
 
-**Field descriptions:**
-
-- `index` (default: `"index.html"`): File to serve for directory requests
-  ```c
-  // GET / -> serves /index.html
-  // GET /about/ -> serves /about/index.html
-  ```
-
-- `extensions` (default: `NULL`): File extensions to try
-  ```c
-  const char *exts[] = { "html", "htm" };
-  Static opts = {
-      .extensions = exts,
-      .extensions_count = 2
-  };
-  // GET /about -> tries /about, /about.html, /about.htm
-  ```
-
-- `etag` (default: `true`): Generate ETag headers for cache validation
-  ```
-  ETag: "1234567-1609459200"
-  ```
-
-- `max_age` (default: `0`): Cache duration in seconds
-  ```c
-  .max_age = 86400  // 1 day
-  // Cache-Control: public, max-age=86400
-  ```
-
-- `dotfiles` (default: `false`): Dotfile handling
-  - `true`: Allow serving dotfiles normally
-  - `false`: Deny serving dotfiles
-
-- `redirect` (default: `true`): Redirect `/path` to `/path/` for directories
-
-- `immutable` (default: `false`): Add `immutable` directive to Cache-Control
-  ```c
-  .immutable = true
-  // Cache-Control: public, max-age=31536000, immutable
-  ```
-
-**Get default options:**
+| Setter | Default | Description |
+|--------|---------|-------------|
+| `ecewo_static_options_set_index(opts, name)` | `"index.html"` | File served for directory requests |
+| `ecewo_static_options_set_extensions(opts, exts, count)` | none | Extension fallbacks tried on 404 |
+| `ecewo_static_options_set_etag(opts, bool)` | `true` | Generate `ETag` headers |
+| `ecewo_static_options_set_max_age(opts, seconds)` | `0` | `Cache-Control` max-age (0 = no header) |
+| `ecewo_static_options_set_dotfiles(opts, bool)` | `false` | Allow serving dotfiles |
+| `ecewo_static_options_set_redirect(opts, bool)` | `true` | 301 redirect `/path` → `/path/` for directories |
+| `ecewo_static_options_set_immutable(opts, bool)` | `false` | Add `immutable` to `Cache-Control` |
 
 ```c
-Static opts = static_default_options();
-// Modify specific fields
-opts.max_age = 3600;
-serve_static("/", "./public", &opts);
+void ecewo_static_options_free(ecewo_static_options_t *opts);
 ```
 
-### SendFile
-
-Options for `send_file()` - matches Express.js `res.sendFile()`:
+**Example:**
 
 ```c
-typedef struct {
-    int max_age;                // Cache duration (seconds)
-    bool last_modified;         // Send Last-Modified header
-    bool cache_control;         // Send Cache-Control header
-    bool accept_ranges;         // Support range requests (future)
-    bool immutable;             // Add immutable directive
-    const char *content_type;   // Override MIME type
-    const char *root;           // Root directory
-    bool dotfiles;              // Allow dotfiles
-} SendFile;
+ecewo_static_options_t *opts = ecewo_static_options_new();
+ecewo_static_options_set_max_age(opts, 86400);     // 1 day
+ecewo_static_options_set_etag(opts, true);
+ecewo_static_options_set_immutable(opts, false);
+
+ecewo_serve_static(app, "/assets", "./dist", opts);
+ecewo_static_options_free(opts);
 ```
 
-**Field descriptions:**
-
-- `max_age` (default: `0`): Cache duration in seconds
-- `last_modified` (default: `true`): Include Last-Modified header
-- `cache_control` (default: `true`): Include Cache-Control header if max_age > 0
-- `accept_ranges` (default: `true`): Reserved for future range request support
-- `immutable` (default: `false`): Add immutable directive
-- `content_type` (default: `NULL`): Override MIME type (NULL = auto-detect)
-- `root` (default: `NULL`): Base directory for relative paths
-- `dotfiles` (default: `false`): Dotfile handling
-
-**Get default options:**
+### send_file options
 
 ```c
-SendFile opts = send_file_default_options();
-// Modify specific fields
-opts.max_age = 86400;
-opts.immutable = true;
-send_file(res, "/assets/app.js", &opts);
+ecewo_send_file_options_t *opts = ecewo_send_file_options_new();
+```
+
+| Setter | Default | Description |
+|--------|---------|-------------|
+| `ecewo_send_file_options_set_etag(opts, bool)` | `true` | Generate `ETag` + handle `If-None-Match` |
+| `ecewo_send_file_options_set_max_age(opts, seconds)` | `0` | `Cache-Control` max-age |
+| `ecewo_send_file_options_set_last_modified(opts, bool)` | `true` | Send `Last-Modified` header |
+| `ecewo_send_file_options_set_cache_control(opts, bool)` | `true` | Send `Cache-Control` when max_age > 0 |
+| `ecewo_send_file_options_set_immutable(opts, bool)` | `false` | Add `immutable` to `Cache-Control` |
+| `ecewo_send_file_options_set_content_type(opts, str)` | `NULL` | Override MIME type (NULL = auto-detect) |
+| `ecewo_send_file_options_set_root(opts, str)` | `NULL` | Base directory for relative paths |
+| `ecewo_send_file_options_set_dotfiles(opts, bool)` | `false` | Allow serving dotfiles |
+
+```c
+void ecewo_send_file_options_free(ecewo_send_file_options_t *opts);
 ```
 
 ## Features
 
 ### Automatic MIME Type Detection
 
-ecewo automatically sets the correct `Content-Type` header based on file extension. **50+ file types supported:**
+The correct `Content-Type` header is set automatically from the file extension:
 
-| Extension          | MIME Type                              | Category     |
-|--------------------|----------------------------------------|--------------|
-| .html, .htm        | text/html; charset=utf-8               | HTML         |
-| .css               | text/css; charset=utf-8                | Stylesheets  |
-| .js, .mjs          | application/javascript; charset=utf-8  | Scripts      |
-| .json              | application/json; charset=utf-8        | Data         |
-| .xml               | application/xml; charset=utf-8         | Data         |
-| .png               | image/png                              | Images       |
-| .jpg, .jpeg        | image/jpeg                             | Images       |
-| .gif               | image/gif                              | Images       |
-| .svg               | image/svg+xml                          | Images       |
-| .ico               | image/x-icon                           | Images       |
-| .webp              | image/webp                             | Images       |
-| .bmp               | image/bmp                              | Images       |
-| .tiff, .tif        | image/tiff                             | Images       |
-| .woff              | font/woff                              | Fonts        |
-| .woff2             | font/woff2                             | Fonts        |
-| .ttf               | font/ttf                               | Fonts        |
-| .otf               | font/otf                               | Fonts        |
-| .eot               | application/vnd.ms-fontobject          | Fonts        |
-| .pdf               | application/pdf                        | Documents    |
-| .txt               | text/plain; charset=utf-8              | Text         |
-| .md                | text/markdown; charset=utf-8           | Text         |
-| .csv               | text/csv; charset=utf-8                | Data         |
-| .mp4               | video/mp4                              | Video        |
-| .webm              | video/webm                             | Video        |
-| .ogg               | video/ogg                              | Video        |
-| .mp3               | audio/mpeg                             | Audio        |
-| .wav               | audio/wav                              | Audio        |
-| .m4a               | audio/mp4                              | Audio        |
-| .zip               | application/zip                        | Archives     |
-| .tar               | application/x-tar                      | Archives     |
-| .gz                | application/gzip                       | Archives     |
-| .7z                | application/x-7z-compressed            | Archives     |
-| .wasm              | application/wasm                       | WebAssembly  |
+| Extension | MIME Type | Category |
+|-----------|-----------|----------|
+| .html, .htm | text/html; charset=utf-8 | HTML |
+| .css | text/css; charset=utf-8 | Stylesheets |
+| .js, .mjs | application/javascript; charset=utf-8 | Scripts |
+| .json | application/json; charset=utf-8 | Data |
+| .xml | application/xml; charset=utf-8 | Data |
+| .png | image/png | Images |
+| .jpg, .jpeg | image/jpeg | Images |
+| .gif | image/gif | Images |
+| .svg | image/svg+xml | Images |
+| .ico | image/x-icon | Images |
+| .webp | image/webp | Images |
+| .bmp | image/bmp | Images |
+| .tiff, .tif | image/tiff | Images |
+| .woff | font/woff | Fonts |
+| .woff2 | font/woff2 | Fonts |
+| .ttf | font/ttf | Fonts |
+| .otf | font/otf | Fonts |
+| .eot | application/vnd.ms-fontobject | Fonts |
+| .pdf | application/pdf | Documents |
+| .txt | text/plain; charset=utf-8 | Text |
+| .md | text/markdown; charset=utf-8 | Text |
+| .csv | text/csv; charset=utf-8 | Data |
+| .mp4 | video/mp4 | Video |
+| .webm | video/webm | Video |
+| .ogg | video/ogg | Video |
+| .mp3 | audio/mpeg | Audio |
+| .wav | audio/wav | Audio |
+| .m4a | audio/mp4 | Audio |
+| .zip | application/zip | Archives |
+| .tar | application/x-tar | Archives |
+| .gz | application/gzip | Archives |
+| .7z | application/x-7z-compressed | Archives |
+| .wasm | application/wasm | WebAssembly |
 
 Unknown extensions default to `application/octet-stream`.
 
 ### ETag Caching
 
-ETags enable efficient cache validation using the `If-None-Match` header.
+ETags enable efficient cache validation. Both `ecewo_serve_static` and `ecewo_send_file` support full ETag round-trips.
 
 **How it works:**
 
-1. Server sends file with ETag header:
+1. Server sends file with ETag:
    ```
    HTTP/1.1 200 OK
    ETag: "12345-1609459200"
    Content-Type: text/html
    ```
 
-2. Browser caches file and stores ETag
+2. Browser caches the file and stores the ETag.
 
-3. On next request, browser sends:
+3. On the next request, the browser sends:
    ```
    GET /index.html HTTP/1.1
    If-None-Match: "12345-1609459200"
    ```
 
-4. If file unchanged, server responds:
+4. If the file is unchanged, the server responds with no body:
    ```
    HTTP/1.1 304 Not Modified
    ETag: "12345-1609459200"
    ```
-   No body sent -> bandwidth saved!
 
-**ETag format:** `"<file-size>-<modification-time>"`
+**ETag format:** `"<size>-<mtime>"`
 
-**Enable/disable:**
+**Disable ETags:**
 
 ```c
-Static opts = {
-    .etag = true   // Enable (default)
-};
-serve_static("/", "./public", &opts);
+ecewo_static_options_t *opts = ecewo_static_options_new();
+ecewo_static_options_set_etag(opts, false);
+ecewo_serve_static(app, "/", "./public", opts);
+ecewo_static_options_free(opts);
 ```
 
 ### Cache Control
 
-Control browser caching with `Cache-Control` headers.
-
 **Basic caching:**
 
 ```c
-Static opts = {
-    .max_age = 3600   // 1 hour
-};
-serve_static("/", "./public", &opts);
+ecewo_static_options_t *opts = ecewo_static_options_new();
+ecewo_static_options_set_max_age(opts, 3600);  // 1 hour
+ecewo_serve_static(app, "/", "./public", opts);
+ecewo_static_options_free(opts);
 // Cache-Control: public, max-age=3600
 ```
 
 **Long-term caching for versioned assets:**
 
 ```c
-Static opts = {
-    .max_age = 31536000,  // 1 year
-    .immutable = true
-};
-serve_static("/assets", "./dist", &opts);
+ecewo_static_options_t *opts = ecewo_static_options_new();
+ecewo_static_options_set_max_age(opts, 31536000);  // 1 year
+ecewo_static_options_set_immutable(opts, true);
+ecewo_serve_static(app, "/assets", "./dist", opts);
+ecewo_static_options_free(opts);
 // Cache-Control: public, max-age=31536000, immutable
-```
-
-**Disable caching:**
-
-```c
-Static opts = {
-    .max_age = 0   // No caching
-};
-serve_static("/", "./public", &opts);
-// No Cache-Control header sent
 ```
 
 **Best practices:**
 
-- **HTML files:** No caching or short max-age (users get updates quickly)
+- **HTML:** No caching; users always get the latest version
   ```c
-  Static opts = { .max_age = 0 };
+  ecewo_static_options_set_max_age(opts, 0);  // default
   ```
 
-- **Versioned assets** (app.v123.js): Long max-age + immutable
+- **Versioned assets** (e.g. `app.v123.js`): Long max-age + immutable
   ```c
-  Static opts = { .max_age = 31536000, .immutable = true };
+  ecewo_static_options_set_max_age(opts, 31536000);
+  ecewo_static_options_set_immutable(opts, true);
   ```
 
-- **Regular assets:** Moderate caching with ETag validation
+- **Regular assets:** Moderate max-age with ETag validation
   ```c
-  Static opts = { .max_age = 3600, .etag = true };
+  ecewo_static_options_set_max_age(opts, 3600);
+  ecewo_static_options_set_etag(opts, true);  // already the default
   ```
 
 ### Security Features
 
 #### Path Traversal Protection
 
-Automatically blocks directory traversal attempts:
+All paths are validated before any filesystem access:
 
 ```
 GET /../../../etc/passwd   -> 403 Forbidden
@@ -620,7 +525,7 @@ GET /path//double/slash    -> 403 Forbidden
 
 #### Dotfile Protection
 
-By default, dotfiles are blocked to prevent exposing sensitive files:
+Dotfiles are blocked by default to prevent exposing sensitive files:
 
 ```
 GET /.env           -> 403 Forbidden
@@ -631,23 +536,14 @@ GET /config/.env    -> 403 Forbidden
 
 > [!WARNING]
 >
-> Never enable dotfiles unless you have a specific reason and understand the security implications!
-
-#### Safe Path Validation
-
-The module validates all paths for:
-- Path traversal sequences (`..`)
-- Null bytes
-- Double slashes
-- Windows drive letters
-- Other malicious patterns
+> Never enable dotfiles unless you have a specific reason and understand the security implications.
 
 ### Index Files
 
-Automatically serve index files for directory requests:
+Directory requests are automatically resolved to the configured index file:
 
 ```c
-serve_static("/", "./public", NULL);
+ecewo_serve_static(app, "/", "./public", NULL);
 
 // GET /           -> ./public/index.html
 // GET /docs/      -> ./public/docs/index.html
@@ -657,67 +553,50 @@ serve_static("/", "./public", NULL);
 **Custom index file:**
 
 ```c
-Static opts = {
-    .index = "home.html"
-};
-serve_static("/", "./public", &opts);
+ecewo_static_options_t *opts = ecewo_static_options_new();
+ecewo_static_options_set_index(opts, "home.html");
+ecewo_serve_static(app, "/", "./public", opts);
+ecewo_static_options_free(opts);
 
-// GET /           -> ./public/home.html
-// GET /docs/      -> ./public/docs/home.html
+// GET /      -> ./public/home.html
+// GET /docs/ -> ./public/docs/home.html
 ```
 
-## Statistics & Monitoring
+### Directory Redirect
 
-Track static file serving performance:
+When `redirect` is enabled (the default), a request for `/docs` automatically redirects to `/docs/` if `docs` is a directory:
+
+```
+GET /docs   -> 301 Location: /docs/
+GET /docs/  -> ./public/docs/index.html
+```
+
+**Disable redirect:**
 
 ```c
-typedef struct {
-    int mounted_paths;           // Number of mounted directories
-    uint64_t total_requests;     // Total requests served
-    uint64_t cache_hits;         // 304 Not Modified responses
-    uint64_t not_found;          // 404 responses
-    uint64_t forbidden;          // 403 responses
-    uint64_t total_bytes_served; // Total bytes served
-} static_stats_t;
+ecewo_static_options_t *opts = ecewo_static_options_new();
+ecewo_static_options_set_redirect(opts, false);
+ecewo_serve_static(app, "/", "./public", opts);
+ecewo_static_options_free(opts);
+// GET /docs -> ./public/docs/index.html (served directly, no redirect)
 ```
 
-**Get statistics:**
+### Extension Fallback
+
+When `extensions` is set, requests that don't match any file will retry with each extension in order before returning 404:
 
 ```c
-void stats_handler(Req *req, Res *res) {
-    static_stats_t stats;
-    static_get_stats(&stats);
-    
-    char *json = arena_sprintf(req->arena,
-        "{"
-        "\"mounted_paths\":%d,"
-        "\"total_requests\":%llu,"
-        "\"cache_hits\":%llu,"
-        "\"not_found\":%llu,"
-        "\"forbidden\":%llu,"
-        "\"total_bytes_served\":%llu,"
-        "\"cache_hit_rate\":%.2f"
-        "}",
-        stats.mounted_paths,
-        (unsigned long long)stats.total_requests,
-        (unsigned long long)stats.cache_hits,
-        (unsigned long long)stats.not_found,
-        (unsigned long long)stats.forbidden,
-        (unsigned long long)stats.total_bytes_served,
-        stats.total_requests > 0 
-            ? (double)stats.cache_hits / stats.total_requests * 100.0 
-            : 0.0
-    );
-    
-    send_json(res, 200, json);
-}
+ecewo_static_options_t *opts = ecewo_static_options_new();
+const char *exts[] = { "html", "htm" };
+ecewo_static_options_set_extensions(opts, exts, 2);
+ecewo_serve_static(app, "/", "./public", opts);
+ecewo_static_options_free(opts);
+
+// GET /about       -> tries ./public/about, ./public/about.html, ./public/about.htm
+// GET /about.html  -> ./public/about.html (exact match, no fallback needed)
 ```
 
-**Reset statistics:**
-
-```c
-static_reset_stats();
-```
+Extensions may be given with or without a leading dot (`"html"` and `".html"` are both accepted).
 
 ## Advanced Examples
 
@@ -725,39 +604,36 @@ static_reset_stats();
 
 ```c
 int main(void) {
-    server_init();
-    static_init();  // Automatically initializes ecewo-fs
-    
-    // Serve main site
-    if (serve_static("/", "./public", NULL) != 0) {
+    ecewo_app_t *app = ecewo_create();
+    ecewo_static_init();
+
+    // Main site; no caching (HTML changes frequently)
+    if (ecewo_serve_static(app, "/", "./public", NULL) != 0) {
         fprintf(stderr, "Failed to mount main site\n");
         return 1;
     }
-    
-    // Serve assets with long-term caching
-    Static asset_opts = {
-        .max_age = 31536000,
-        .immutable = true,
-        .etag = true
-    };
-    if (serve_static("/assets", "./dist", &asset_opts) != 0) {
+
+    // Versioned assets; long-term caching
+    ecewo_static_options_t *asset_opts = ecewo_static_options_new();
+    ecewo_static_options_set_max_age(asset_opts, 31536000);
+    ecewo_static_options_set_immutable(asset_opts, true);
+    if (ecewo_serve_static(app, "/assets", "./dist", asset_opts) != 0) {
         fprintf(stderr, "Failed to mount assets\n");
         return 1;
     }
-    
-    // Serve docs with moderate caching
-    Static docs_opts = {
-        .max_age = 3600,
-        .etag = true
-    };
-    if (serve_static("/docs", "./documentation", &docs_opts) != 0) {
+    ecewo_static_options_free(asset_opts);
+
+    // Docs; moderate caching
+    ecewo_static_options_t *docs_opts = ecewo_static_options_new();
+    ecewo_static_options_set_max_age(docs_opts, 3600);
+    if (ecewo_serve_static(app, "/docs", "./documentation", docs_opts) != 0) {
         fprintf(stderr, "Failed to mount docs\n");
         return 1;
     }
-    
-    server_atexit(static_cleanup);  // Also cleans up fs module
-    server_listen(3000);
-    server_run();
+    ecewo_static_options_free(docs_opts);
+
+    ecewo_atexit(app, ecewo_static_cleanup);
+    ecewo_listen(app, 3000);
     return 0;
 }
 ```
@@ -766,138 +642,117 @@ int main(void) {
 
 > [!WARNING]
 >
-> Define API routes **before** static file serving to ensure proper routing priority.
+> Register API routes **before** static mounts to ensure proper routing priority.
 
 ```c
-void api_users(Req *req, Res *res) {
-    send_json(res, 200, "{\"users\":[]}");
+void api_users(ecewo_request_t *req, ecewo_response_t *res) {
+    ecewo_send_json(res, 200, "{\"users\":[]}");
 }
 
-void api_products(Req *req, Res *res) {
-    send_json(res, 200, "{\"products\":[]}");
+void api_products(ecewo_request_t *req, ecewo_response_t *res) {
+    ecewo_send_json(res, 200, "{\"products\":[]}");
 }
 
 int main(void) {
-    server_init();
-    static_init();  // Automatically initializes ecewo-fs
-    
-    // Define API routes FIRST
-    get("/api/users", api_users);
-    get("/api/products", api_products);
-    
-    // Static files LAST (fallback)
-    if (serve_static("/", "./public", NULL) != 0) {
+    ecewo_app_t *app = ecewo_create();
+    ecewo_static_init();
+
+    // API routes first
+    ECEWO_GET(app, "/api/users",    api_users);
+    ECEWO_GET(app, "/api/products", api_products);
+
+    // Static files last (fallback)
+    if (ecewo_serve_static(app, "/", "./public", NULL) != 0) {
         fprintf(stderr, "Failed to mount static files\n");
         return 1;
     }
-    
-    /*
-     * Request handling priority:
-     * 1. GET /api/users     -> api_users() handler
-     * 2. GET /api/products  -> api_products() handler
-     * 3. GET /*             -> Static files
-     */
-    
-    server_atexit(static_cleanup);  // Also cleans up fs module
-    server_listen(3000);
-    server_run();
+
+    ecewo_atexit(app, ecewo_static_cleanup);
+    ecewo_listen(app, 3000);
     return 0;
 }
 ```
 
 ### SPA (Single Page Application) Support
 
-For SPAs like React, Vue, or Angular, serve `index.html` for all non-file routes:
-
 ```c
-void spa_handler(Req *req, Res *res) {
-    // Serve index.html for all routes
-    SendFile opts = {
-        .max_age = 0,           // Don't cache HTML
-        .cache_control = false
-    };
-    send_file(res, "./public/index.html", &opts);
+void spa_fallback(ecewo_request_t *req, ecewo_response_t *res) {
+    ecewo_send_file_options_t *opts = ecewo_send_file_options_new();
+    ecewo_send_file_options_set_max_age(opts, 0);
+    ecewo_send_file_options_set_cache_control(opts, false);
+
+    ecewo_send_file(req, res, "./public/index.html", opts);
+    ecewo_send_file_options_free(opts);
 }
 
 int main(void) {
-    server_init();
-    static_init();  // Automatically initializes ecewo-fs
-    
+    ecewo_app_t *app = ecewo_create();
+    ecewo_static_init();
+
     // API routes
-    get("/api/*", api_handler);
-    
-    // Static assets with caching
-    Static opts = {
-        .max_age = 31536000,
-        .immutable = true
-    };
-    if (serve_static("/static", "./public/static", &opts) != 0) {
-        fprintf(stderr, "Failed to mount static assets\n");
-        return 1;
-    }
-    
-    // SPA fallback - serve index.html for all other routes
-    get("/*", spa_handler);
-    
-    server_atexit(static_cleanup);  // Also cleans up fs module
-    server_listen(3000);
-    server_run();
+    ECEWO_GET(app, "/api/*", api_handler);
+
+    // Versioned static assets
+    ecewo_static_options_t *asset_opts = ecewo_static_options_new();
+    ecewo_static_options_set_max_age(asset_opts, 31536000);
+    ecewo_static_options_set_immutable(asset_opts, true);
+    ecewo_serve_static(app, "/static", "./public/static", asset_opts);
+    ecewo_static_options_free(asset_opts);
+
+    // SPA fallback; all other routes serve index.html
+    ECEWO_GET(app, "/*", spa_fallback);
+
+    ecewo_atexit(app, ecewo_static_cleanup);
+    ecewo_listen(app, 3000);
     return 0;
 }
 ```
 
-### Conditional File Serving
+### Protected File Download
 
 ```c
-void protected_file_handler(Req *req, Res *res) {
-    // Check authentication
-    const char *token = get_header(req, "Authorization");
+void protected_download(ecewo_request_t *req, ecewo_response_t *res) {
+    const char *token = ecewo_header_get(req, "Authorization");
     if (!token || !validate_token(token)) {
-        send_text(res, 401, "Unauthorized");
+        ecewo_send_text(res, 401, "Unauthorized");
         return;
     }
-    
-    // Serve protected file
-    const char *file = get_param(req, "file");
-    char *filepath = arena_sprintf(req->arena, "protected/%s", file);
-    
-    SendFile opts = {
-        .root = NULL,
-        .max_age = 0,           // Don't cache protected files
-        .dotfiles = false
-    };
-    
-    send_file(res, filepath, &opts);
+
+    const char *file = ecewo_param(req, "file");
+
+    ecewo_send_file_options_t *opts = ecewo_send_file_options_new();
+    ecewo_send_file_options_set_root(opts, "/var/protected");
+    ecewo_send_file_options_set_max_age(opts, 0);
+
+    ecewo_send_file(req, res, file, opts);
+    ecewo_send_file_options_free(opts);
 }
 ```
 
-### Custom 404 Handler
+### Custom 404 Page
 
 ```c
-void custom_404(Req *req, Res *res) {
-    SendFile opts = {
-        .max_age = 3600,
-        .content_type = "text/html; charset=utf-8"
-    };
-    send_file(res, "./public/404.html", &opts);
+void custom_404(ecewo_request_t *req, ecewo_response_t *res) {
+    ecewo_send_file_options_t *opts = ecewo_send_file_options_new();
+    ecewo_send_file_options_set_max_age(opts, 3600);
+
+    ecewo_send_file(req, res, "./public/404.html", opts);
+    ecewo_send_file_options_free(opts);
 }
 
 int main(void) {
-    server_init();
-    static_init();  // Automatically initializes ecewo-fs
-    
-    // Static files
-    if (serve_static("/", "./public", NULL) != 0) {
+    ecewo_app_t *app = ecewo_create();
+    ecewo_static_init();
+
+    if (ecewo_serve_static(app, "/", "./public", NULL) != 0) {
         fprintf(stderr, "Failed to mount static files\n");
         return 1;
     }
-    
-    // Custom 404 (must be last)
-    get("/*", custom_404);
-    
-    server_atexit(static_cleanup);  // Also cleans up fs module
-    server_listen(3000);
-    server_run();
+
+    ECEWO_GET(app, "/*", custom_404);  // must be last
+
+    ecewo_atexit(app, ecewo_static_cleanup);
+    ecewo_listen(app, 3000);
     return 0;
 }
 ```
@@ -905,6 +760,6 @@ int main(void) {
 ## Limitations
 
 - Maximum file size: 100 MB (configurable via `ECEWO_FS_MAX_FILE_SIZE`)
-- No built-in compression (use reverse proxy like nginx)
-- No range request support yet (planned for future)
-- No directory listing (use a frontend framework or custom handler)
+- No built-in compression (use a reverse proxy such as nginx)
+- No range request support
+- No directory listing
