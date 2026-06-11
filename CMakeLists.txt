@@ -25,9 +25,9 @@ if (PROJECT_IS_TOP_LEVEL AND NOT TARGET ecewo::ecewo)
 endif()
 
 if(ECEWO_STATIC_BUILD_SHARED)
-  add_library(ecewo-static SHARED ecewo-static.c)
+  add_library(ecewo-static SHARED src/ecewo-static.c)
 else()
-  add_library(ecewo-static STATIC ecewo-static.c)
+  add_library(ecewo-static STATIC src/ecewo-static.c)
 endif()
 
 add_library(ecewo::static ALIAS ecewo-static)
@@ -39,7 +39,7 @@ generate_export_header(ecewo-static
 )
 
 target_include_directories(ecewo-static PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
