@@ -21,6 +21,7 @@
 
 #include "ecewo-static.h"
 #include "ecewo-fs.h"
+#include "uv.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -133,6 +134,7 @@ typedef struct {
   bool immutable;
   char **extensions; // borrowed pointers into app arena
   int extensions_count;
+  const char *root; // mount directory; every served file must resolve inside it
 } static_cfg_t;
 
 typedef struct {
@@ -416,6 +418,145 @@ void ecewo_static_cleanup(void) {
 // Helpers
 // ============================================================================
 
+// Collapses ".", "..", and repeated separators in a URL-relative path, and
+// fails outright on anything that could reach outside the mount: an absolute
+// path, a Windows drive letter, a backslash separator, or a ".." that would
+// climb above the root. The result never contains a "." or ".." segment, so
+// joining it onto the mount directory cannot escape lexically.
+static bool normalize_rel_path(const char *rel, char *out, size_t out_size) {
+  if (!rel || !out || out_size == 0)
+    return false;
+
+  if (rel[0] == '/' || rel[0] == '\\')
+    return false; // absolute: never relative to the mount
+  if (rel[0] != '\0' && rel[1] == ':')
+    return false; // Windows drive letter
+  if (strchr(rel, '\\') != NULL)
+    return false; // backslash is not a URL path separator
+
+  // Offsets into `out` where each kept segment starts, so ".." can pop one.
+  size_t starts[128];
+  size_t depth = 0;
+  size_t len = 0;
+
+  const char *p = rel;
+  while (*p) {
+    while (*p == '/')
+      p++;
+    if (!*p)
+      break;
+
+    const char *seg = p;
+    while (*p && *p != '/')
+      p++;
+    size_t seg_len = (size_t)(p - seg);
+
+    if (seg_len == 1 && seg[0] == '.')
+      continue;
+
+    if (seg_len == 2 && seg[0] == '.' && seg[1] == '.') {
+      if (depth == 0)
+        return false; // climbs above the mount
+      depth--;
+      len = starts[depth];
+      if (len > 0)
+        len--; // drop the separator we wrote before that segment
+      continue;
+    }
+
+    if (depth >= sizeof(starts) / sizeof(starts[0]))
+      return false; // pathologically deep
+
+    size_t need = (len > 0 ? 1u : 0u) + seg_len;
+    if (len + need + 1 > out_size)
+      return false;
+
+    if (len > 0)
+      out[len++] = '/';
+    starts[depth++] = len;
+    memcpy(out + len, seg, seg_len);
+    len += seg_len;
+  }
+
+  out[len] = '\0';
+  return true;
+}
+
+// Percent-encodes a URL path for use in a Location header, leaving the
+// separators and the unreserved set alone.
+static bool encode_url_path(const char *path, char *out, size_t out_size) {
+  static const char hex[] = "0123456789ABCDEF";
+  size_t len = 0;
+
+  for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+    unsigned char c = *p;
+    bool literal = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+        || (c >= '0' && c <= '9')
+        || c == '-' || c == '_' || c == '.' || c == '~' || c == '/';
+
+    if (literal) {
+      if (len + 2 > out_size)
+        return false;
+      out[len++] = (char)c;
+    } else {
+      if (len + 4 > out_size)
+        return false;
+      out[len++] = '%';
+      out[len++] = hex[(c >> 4) & 0xF];
+      out[len++] = hex[c & 0xF];
+    }
+  }
+
+  out[len] = '\0';
+  return true;
+}
+
+// Resolves symlinks on both sides and confirms `path` really sits inside
+// `root`. Lexical normalisation alone cannot see through a symlink that points
+// out of the served directory, so this runs once the file is known to exist.
+// Synchronous on purpose: it is one lstat-chain per served file, and the
+// alternative is serving whatever the link happens to point at.
+static bool path_within_root(const char *root, const char *path) {
+  if (!root || !*root)
+    return true; // no root configured: caller opted out of confinement
+
+  uv_fs_t root_req;
+  uv_fs_t path_req;
+  bool ok = false;
+
+  if (uv_fs_realpath(NULL, &root_req, root, NULL) < 0) {
+    uv_fs_req_cleanup(&root_req);
+    return false;
+  }
+
+  if (uv_fs_realpath(NULL, &path_req, path, NULL) < 0) {
+    uv_fs_req_cleanup(&root_req);
+    uv_fs_req_cleanup(&path_req);
+    return false;
+  }
+
+  const char *real_root = (const char *)root_req.ptr;
+  const char *real_path = (const char *)path_req.ptr;
+
+  if (real_root && real_path) {
+    size_t root_len = strlen(real_root);
+    while (root_len > 1 && (real_root[root_len - 1] == '/' || real_root[root_len - 1] == '\\'))
+      root_len--;
+
+    if (strncmp(real_path, real_root, root_len) == 0) {
+      char next = real_path[root_len];
+      // Either the root itself, or a path that continues with a separator -
+      // never a sibling directory that merely shares the prefix.
+      ok = (next == '\0') || (next == '/') || (next == '\\')
+          || (root_len == 1 && (real_root[0] == '/' || real_root[0] == '\\'));
+    }
+  }
+
+  uv_fs_req_cleanup(&root_req);
+  uv_fs_req_cleanup(&path_req);
+  return ok;
+}
+
 static bool is_safe_path(const char *path) {
   if (!path || *path == '\0')
     return false;
@@ -468,6 +609,7 @@ typedef struct {
   int ext_index; // next extension index to try on ENOENT
   char *mime_type;
   char *etag;
+  char *url_path; // normalised, percent-encoded URL for the directory redirect
 } static_file_ctx_t;
 
 static void on_file_stat(const char *error, const fs_stat_t *stat, void *user_data);
@@ -476,7 +618,8 @@ static void on_file_read(const char *error, const char *data, size_t size, void 
 static void send_file_internal(ecewo_request_t *req,
                                ecewo_response_t *res,
                                const char *filepath,
-                               const static_cfg_t *cfg) {
+                               const static_cfg_t *cfg,
+                               const char *url_path) {
   if (!res || !filepath) {
     if (res)
       ecewo_send_text(res, 500, "Internal server error");
@@ -508,6 +651,7 @@ static void send_file_internal(ecewo_request_t *req,
   ctx->ext_index = 0;
   ctx->mime_type = ecewo_strdup(arena, ecewo_static_mime_type(filepath));
   ctx->etag = NULL;
+  ctx->url_path = url_path ? ecewo_strdup(arena, url_path) : NULL;
 
   if (!ctx->filepath || !ctx->mime_type) {
     ecewo_send_text(res, 500, "Memory allocation failed");
@@ -548,13 +692,23 @@ static void on_file_stat(const char *error, const fs_stat_t *stat, void *user_da
     return;
   }
 
+  // The file exists. Resolve symlinks and confirm it is really inside the
+  // mounted directory before anything is served from it.
+  if (!path_within_root(ctx->cfg.root, ctx->filepath)) {
+    ecewo_send_text(res, 403, "Forbidden: Path escapes served directory");
+    return;
+  }
+
   // Directory handling
   if (IS_DIR_MODE(fs_stat_mode(stat))) {
     if (ctx->cfg.redirect) {
-      const char *url_path = ecewo_req_path(ctx->req);
-      char *location = ecewo_sprintf(arena, "%s/", url_path);
-      if (location)
-        ecewo_header_set(res, "Location", location);
+      // Built from the normalised mount + relative path, never from the raw
+      // request target, and percent-encoded so it cannot carry control bytes.
+      if (ctx->url_path) {
+        char *location = ecewo_sprintf(arena, "%s/", ctx->url_path);
+        if (location)
+          ecewo_header_set(res, "Location", location);
+      }
       ecewo_send(res, 301, NULL, 0);
     } else {
       // Serve the index file directly; skip ETag since we lack the index's stat
@@ -566,6 +720,10 @@ static void on_file_stat(const char *error, const fs_stat_t *stat, void *user_da
       ctx->filepath = index_path;
       ctx->mime_type = ecewo_strdup(arena, ecewo_static_mime_type(index_path));
       ctx->cfg.etag = false;
+      if (!path_within_root(ctx->cfg.root, ctx->filepath)) {
+        ecewo_send_text(res, 403, "Forbidden: Path escapes served directory");
+        return;
+      }
       if (fs_read_file(ctx->filepath, arena, on_file_read, ctx) != 0)
         ecewo_send_text(res, 503, "Service temporarily unavailable");
     }
@@ -660,6 +818,11 @@ static void send_file_on_stat(const char *error, const fs_stat_t *stat, void *us
       ecewo_send_text(res, 403, "Permission denied");
     else
       ecewo_send_text(res, 500, "Internal server error");
+    return;
+  }
+
+  if (!path_within_root(ctx->cfg.root, ctx->resolved_path)) {
+    ecewo_send_text(res, 403, "Forbidden: Path escapes served directory");
     return;
   }
 
@@ -781,11 +944,29 @@ void ecewo_send_file(ecewo_request_t *req,
   }
 
   char resolved_path[2048];
-  if (cfg.root && filepath[0] != '/') {
-    snprintf(resolved_path, sizeof(resolved_path), "%s/%s", cfg.root, filepath);
+  if (cfg.root) {
+    // With a root configured, filepath is ALWAYS relative to it. An absolute
+    // path (or one that climbs out with "..") is rejected rather than silently
+    // escaping the root the caller asked for.
+    char rel[2048];
+    if (!normalize_rel_path(filepath, rel, sizeof(rel))) {
+      ecewo_send_text(res, 403, "Forbidden: Invalid path");
+      return;
+    }
+    int n = snprintf(resolved_path, sizeof(resolved_path), "%s/%s", cfg.root, rel);
+    if (n < 0 || (size_t)n >= sizeof(resolved_path)) {
+      ecewo_send_text(res, 414, "Path too long");
+      return;
+    }
   } else {
-    strncpy(resolved_path, filepath, sizeof(resolved_path) - 1);
-    resolved_path[sizeof(resolved_path) - 1] = '\0';
+    // No root: the caller is naming a file itself, not deriving one from a
+    // request, so an absolute path is legitimate here.
+    size_t flen = strlen(filepath);
+    if (flen >= sizeof(resolved_path)) {
+      ecewo_send_text(res, 414, "Path too long");
+      return;
+    }
+    memcpy(resolved_path, filepath, flen + 1);
   }
 
   if (!is_safe_path(resolved_path)) {
@@ -810,6 +991,17 @@ void ecewo_send_file(ecewo_request_t *req,
   ctx->cfg = cfg;
   ctx->etag_value = NULL;
   ctx->resolved_path = ecewo_strdup(arena, resolved_path);
+
+  // The caller is documented to be allowed to free `options` as soon as this
+  // returns, but the stat/read callbacks below run later - so root has to be
+  // copied into the request arena rather than borrowed from the options.
+  if (cfg.root) {
+    ctx->cfg.root = ecewo_strdup(arena, cfg.root);
+    if (!ctx->cfg.root) {
+      ecewo_send_text(res, 500, "Memory allocation failed");
+      return;
+    }
+  }
 
   if (cfg.content_type)
     ctx->mime_type = ecewo_strdup(arena, cfg.content_type);
@@ -854,12 +1046,25 @@ static void static_handler(ecewo_request_t *req, ecewo_response_t *res) {
   }
 
   static_cfg_t cfg = matched->cfg;
+  cfg.root = matched->dir_path;
   size_t mount_len = matched->mount_len;
   const char *dir_path = matched->dir_path;
 
-  const char *rel_path = url_path + mount_len;
-  if (*rel_path == '/')
-    rel_path++;
+  const char *raw_rel = url_path + mount_len;
+  if (*raw_rel == '/')
+    raw_rel++;
+
+  // Whether the URL names a directory has to be read from the request, before
+  // normalisation drops the trailing slash.
+  bool is_dir = (*raw_rel == '\0' || raw_rel[strlen(raw_rel) - 1] == '/');
+
+  // Collapse "." / ".." / duplicate slashes and reject anything that climbs
+  // out of the mount, so the join below cannot escape lexically.
+  char rel_path[2048];
+  if (!normalize_rel_path(raw_rel, rel_path, sizeof(rel_path))) {
+    ecewo_send_text(res, 403, "Forbidden: Invalid path");
+    return;
+  }
 
   if (should_deny_dotfile(cfg.dotfiles, rel_path)) {
     ecewo_send_text(res, 403, "Forbidden: Dotfile access denied");
@@ -867,16 +1072,18 @@ static void static_handler(ecewo_request_t *req, ecewo_response_t *res) {
   }
 
   char filepath[2048];
-
-  // URL already targets a directory (trailing slash or root)
-  // Serve index directly without redirect or extension fallback.
-  bool is_dir = (*rel_path == '\0' || rel_path[strlen(rel_path) - 1] == '/');
+  int n;
 
   if (is_dir) {
     if (*rel_path == '\0')
-      snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, cfg.index);
+      n = snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, cfg.index);
     else
-      snprintf(filepath, sizeof(filepath), "%s/%s%s", dir_path, rel_path, cfg.index);
+      n = snprintf(filepath, sizeof(filepath), "%s/%s/%s", dir_path, rel_path, cfg.index);
+
+    if (n < 0 || (size_t)n >= sizeof(filepath)) {
+      ecewo_send_text(res, 414, "Path too long");
+      return;
+    }
 
     if (!is_safe_path(filepath)) {
       ecewo_send_text(res, 403, "Forbidden: Invalid path");
@@ -888,18 +1095,38 @@ static void static_handler(ecewo_request_t *req, ecewo_response_t *res) {
     dir_cfg.redirect = false;
     dir_cfg.extensions = NULL;
     dir_cfg.extensions_count = 0;
-    send_file_internal(req, res, filepath, &dir_cfg);
+    send_file_internal(req, res, filepath, &dir_cfg, NULL);
   } else {
     // URL targets a file or possibly an un-slashed directory.
-    // Pass the raw path; on_file_stat handles redirect if it turns out to be a dir.
-    snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, rel_path);
+    // on_file_stat handles the redirect if it turns out to be a directory.
+    n = snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, rel_path);
+
+    if (n < 0 || (size_t)n >= sizeof(filepath)) {
+      ecewo_send_text(res, 414, "Path too long");
+      return;
+    }
 
     if (!is_safe_path(filepath)) {
       ecewo_send_text(res, 403, "Forbidden: Invalid path");
       return;
     }
 
-    send_file_internal(req, res, filepath, &cfg);
+    // The redirect target is rebuilt from the mount and the normalised
+    // relative path, then percent-encoded - never echoed from the raw request.
+    char canonical[2048];
+    char encoded[4096];
+    const char *sep = (matched->mount_len > 0
+                       && matched->mount_path[matched->mount_len - 1] == '/')
+        ? ""
+        : "/";
+    int c = snprintf(canonical, sizeof(canonical), "%s%s%s",
+                     matched->mount_path, sep, rel_path);
+    const char *canonical_url = NULL;
+    if (c > 0 && (size_t)c < sizeof(canonical)
+        && encode_url_path(canonical, encoded, sizeof(encoded)))
+      canonical_url = encoded;
+
+    send_file_internal(req, res, filepath, &cfg, canonical_url);
   }
 }
 

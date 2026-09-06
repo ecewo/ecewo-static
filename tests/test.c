@@ -15,6 +15,42 @@ static void send_file_test_handler(ecewo_request_t *req, ecewo_response_t *res) 
   ecewo_send_file(req, res, "./test_public/index.html", NULL);
 }
 
+// root is configured, so an absolute filepath must NOT escape it.
+static void send_file_absolute_handler(ecewo_request_t *req, ecewo_response_t *res) {
+  ecewo_send_file_options_t *opts = ecewo_send_file_options_new();
+  if (!opts) {
+    ecewo_send_text(res, 500, "no opts");
+    return;
+  }
+  ecewo_send_file_options_set_root(opts, "./test_public");
+  ecewo_send_file(req, res, "/etc/passwd", opts);
+  ecewo_send_file_options_free(opts);
+}
+
+// root is configured, so ".." must NOT climb above it.
+static void send_file_traversal_handler(ecewo_request_t *req, ecewo_response_t *res) {
+  ecewo_send_file_options_t *opts = ecewo_send_file_options_new();
+  if (!opts) {
+    ecewo_send_text(res, 500, "no opts");
+    return;
+  }
+  ecewo_send_file_options_set_root(opts, "./test_public");
+  ecewo_send_file(req, res, "../test_outside/secret.txt", opts);
+  ecewo_send_file_options_free(opts);
+}
+
+// A relative path under root still has to work.
+static void send_file_rooted_ok_handler(ecewo_request_t *req, ecewo_response_t *res) {
+  ecewo_send_file_options_t *opts = ecewo_send_file_options_new();
+  if (!opts) {
+    ecewo_send_text(res, 500, "no opts");
+    return;
+  }
+  ecewo_send_file_options_set_root(opts, "./test_public");
+  ecewo_send_file(req, res, "index.html", opts);
+  ecewo_send_file_options_free(opts);
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -328,8 +364,25 @@ void setup_static_routes(ecewo_app_t *app) {
     ecewo_static_options_free(ext_opts);
   }
 
+  // A file outside the mount, plus a symlink inside it that points there.
+  mkdir_sync("test_outside");
+  write_file("test_outside/secret.txt", "OUTSIDE_SECRET");
+#ifndef _WIN32
+  {
+    uv_fs_t req;
+    uv_fs_unlink(NULL, &req, "test_public/escape.txt", NULL);
+    uv_fs_req_cleanup(&req);
+    uv_fs_symlink(NULL, &req, "../test_outside/secret.txt",
+                  "test_public/escape.txt", 0, NULL);
+    uv_fs_req_cleanup(&req);
+  }
+#endif
+
   // Route for send_file tests
   ECEWO_GET(app, "/sendfile", send_file_test_handler);
+  ECEWO_GET(app, "/sendfile-absolute", send_file_absolute_handler);
+  ECEWO_GET(app, "/sendfile-traversal", send_file_traversal_handler);
+  ECEWO_GET(app, "/sendfile-rooted", send_file_rooted_ok_handler);
 }
 
 void cleanup_static(void) {
@@ -353,8 +406,92 @@ void cleanup_static(void) {
   }
   uv_fs_req_cleanup(&req);
 
+  uv_fs_unlink(NULL, &req, "test_public/escape.txt", NULL);
+  uv_fs_req_cleanup(&req);
   uv_fs_rmdir(NULL, &req, "test_public", NULL);
   uv_fs_req_cleanup(&req);
+  uv_fs_unlink(NULL, &req, "test_outside/secret.txt", NULL);
+  uv_fs_req_cleanup(&req);
+  uv_fs_rmdir(NULL, &req, "test_outside", NULL);
+  uv_fs_req_cleanup(&req);
+}
+
+// A symlink inside the served directory that points outside it must not be
+// followed: lexical checks cannot see it, only realpath containment can.
+int test_symlink_escape_blocked(void) {
+  MockParams params = {
+    .method = MOCK_GET,
+    .path = "/escape.txt",
+    .body = NULL,
+    .headers = NULL,
+    .header_count = 0
+  };
+
+  MockResponse res = request(&params);
+
+  ASSERT_NE(200, res.status_code);
+  if (res.body)
+    ASSERT_NULL(strstr(res.body, "OUTSIDE_SECRET"));
+
+  free_request(&res);
+  RETURN_OK();
+}
+
+int test_send_file_absolute_path_blocked(void) {
+  MockParams params = {
+    .method = MOCK_GET,
+    .path = "/sendfile-absolute",
+    .body = NULL,
+    .headers = NULL,
+    .header_count = 0
+  };
+
+  MockResponse res = request(&params);
+
+  ASSERT_NE(200, res.status_code);
+  if (res.body)
+    ASSERT_NULL(strstr(res.body, "root:"));
+
+  free_request(&res);
+  RETURN_OK();
+}
+
+int test_send_file_traversal_blocked(void) {
+  MockParams params = {
+    .method = MOCK_GET,
+    .path = "/sendfile-traversal",
+    .body = NULL,
+    .headers = NULL,
+    .header_count = 0
+  };
+
+  MockResponse res = request(&params);
+
+  ASSERT_NE(200, res.status_code);
+  if (res.body)
+    ASSERT_NULL(strstr(res.body, "OUTSIDE_SECRET"));
+
+  free_request(&res);
+  RETURN_OK();
+}
+
+// The confinement must not break the legitimate rooted case.
+int test_send_file_rooted_ok(void) {
+  MockParams params = {
+    .method = MOCK_GET,
+    .path = "/sendfile-rooted",
+    .body = NULL,
+    .headers = NULL,
+    .header_count = 0
+  };
+
+  MockResponse res = request(&params);
+
+  ASSERT_EQ(200, res.status_code);
+  ASSERT_NOT_NULL(strstr(res.body, "<html>"));
+
+  free_request(&res);
+  RETURN_OK();
 }
 
 int main(void) {
@@ -384,6 +521,10 @@ int main(void) {
   RUN_TEST(test_static_extensions);
   RUN_TEST(test_send_file);
   RUN_TEST(test_send_file_etag_304);
+  RUN_TEST(test_symlink_escape_blocked);
+  RUN_TEST(test_send_file_absolute_path_blocked);
+  RUN_TEST(test_send_file_traversal_blocked);
+  RUN_TEST(test_send_file_rooted_ok);
 
   printf("\nAll tests passed!\n");
 
